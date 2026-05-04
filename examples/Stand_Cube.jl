@@ -3,56 +3,56 @@ using FrankWolfe
 using LinearAlgebra
 using Random
 using Boscia
+using Bonobo
 using CUDA
 #CUDA.set_runtime_version!(v"12.6")
 using StableRNGs
+include("../src/Branching_nodes.jl")
 include("../src/BLMO.jl")
 include("../src/Managed_blmo.jl")
+include("../src/Initialize.jl")
 include("../src/StandardFrankWolfe.jl")
 
 println("\nNonlinear Example - GPU")
 seed = rand(UInt64)
 @show seed
 rng = StableRNG(seed)
-n = 20000
-
-# ── LMO ──────────────────────────────────────────────
-int_vars = collect(1:Int(n/2))
-
-bounds = Boscia.IntegerBounds()
-
-lbs = zeros(Int(n/2))
-ubs = ones(Int(n/2))
-blmo = Boscia.CubeLMO(zeros(n), ones(n), int_vars)
-
-lmo = Boscia.ManagedBoundedLMO(blmo, lbs[int_vars], ubs[int_vars], int_vars, n)
 
 # ── obj ──────────────────────────────────────────
-const A_gpu = let
-    M_gpu = CUDA.randn(Float32, n, n)
-    A = M_gpu' * M_gpu  
-    A
+n = 8
+m = 70000
+
+const X = rand(rng, Float32, n, m)
+const X_gpu = CuArray(X)
+const Y = rand(rng, Float32, n, m)
+const Y_gpu = CuArray(Y)
+
+int_vars = collect(1:n*n)
+lbs = fill(-128.0, n*n)
+ubs = fill(128.0, n*n)
+
+blmo = Boscia.CubeLMO(lbs, ubs, int_vars)
+lmo = Boscia.ManagedBoundedLMO(blmo, lbs, ubs, int_vars, n*n)
+
+function f(w)
+    W = reshape(w, n, n)
+    return norm(W * X .- Y)^2
 end
-const A = Array(Float64.(A_gpu))  
 
-const y = rand(rng, Bool, n) * 0.6 .+ 0.3
-const y_gpu = CuArray(Float32.(y))
+const R_buf_gpu = CUDA.zeros(Float32, n, m)
+const R_buf_cpu = zeros(Float32, n, m)
 
-function f(x)
-    d = x .- y
-    return dot(d, A * d)
-end
-
-x_gpu_buf = CUDA.zeros(Float32, n)  
-
-function grad!(storage, x)
-    if x isa CuArray
-        mul!(storage, A_gpu, x)
-        return mul!(storage, A_gpu, y_gpu, -2f0, 2f0)
+function grad!(storage, w)
+    if w isa CuArray
+        mul!(R_buf_gpu, reshape(w, n, n), X_gpu)
+        @. R_buf_gpu -= Y_gpu
+        mul!(reshape(storage, n, n), R_buf_gpu, X_gpu')
+        @. storage *= 2f0
     else
-        println("warning: compute on cpu")
-        mul!(storage, A, x)
-        return mul!(storage, A, y, -2.0, 2.0)
+        mul!(R_buf_cpu, reshape(w, n, n), X)
+        @. R_buf_cpu -= Y
+        mul!(reshape(storage, n, n), R_buf_cpu, X')
+        @. storage *= 2f0
     end
 end
 
@@ -60,23 +60,10 @@ end
 variant = StandardFrankWolfeGPU(256)
 
 # ── Solve ──────────────────────────────────────────────
-depth = 5
-heu = Boscia.Heuristic(
-    (tree, blmo, x) -> Boscia.follow_gradient_heuristic(tree, blmo, x, depth),
-    0.8,
-    :follow_gradient,
-)
-heu2 = Boscia.Heuristic(Boscia.rounding_lmo_01_heuristic, 0.8, :lmo_rounding)
-
-heuristics = [heu, heu2]
-# heuristics = []
 
 settings = Boscia.create_default_settings()
 settings.branch_and_bound[:verbose] = true
 settings.branch_and_bound[:print_iter] = 500
-settings.branch_and_bound[:time_limit] = 300
-settings.heuristic[:custom_heuristics] = heuristics
+settings.branch_and_bound[:time_limit] = 1200
 settings.frank_wolfe[:variant] = variant
 x, _, _ = Boscia.solve(f, grad!, lmo, settings=settings)
-
-show(to)
