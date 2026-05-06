@@ -12,6 +12,31 @@ GPU-accelerated Branch-and-Bound with Frank-Wolfe methods, built on top of [Bosc
 - A working NVIDIA driver (check with `nvidia-smi`)
 - CUDA toolkit 12.6 (managed automatically by CUDA.jl, but the driver must be installed at the system level)
 
+## Environment Setup
+
+This project requires a conda environment with CUDA toolkit 12.6, because the system may not have CUDA installed globally.
+
+```bash
+conda create -n julia_cuda
+conda activate julia_cuda
+conda install -c nvidia cuda-toolkit=12.6
+```
+
+Then set the following environment variables so Julia can find the toolkit:
+
+```bash
+export CUDA_HOME=/path/to/conda/envs/julia_cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+```
+
+**Always activate this environment before starting Julia:**
+
+```bash
+conda activate julia_cuda
+julia --project=. --threads=4 -e 'include("examples/DICG_Cube.jl")'
+```
+
 ## Installation
 
 Clone the repo and instantiate the Julia environment:
@@ -60,6 +85,10 @@ This means Julia cannot find a working NVIDIA driver. This is a system-level iss
 **Slow first run**
 
 Julia compiles code on first execution (JIT). The first run will be significantly slower than subsequent ones. This is expected.
+
+**Out of memory**
+
+The examples allocate large GPU arrays. If you run out of VRAM, try reducing `m` in the example scripts.
 
 **Out of memory**
 
