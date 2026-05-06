@@ -30,12 +30,14 @@ export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 ```
 
-**Always activate this environment before starting Julia:**
+**If you are running the examples manually (not via the provided SLURM scripts), activate the environment first:**
 
 ```bash
 conda activate julia_cuda
 julia --project=. --threads=4 -e 'include("examples/DICG_Cube.jl")'
 ```
+
+If you are using the provided SLURM scripts to run on an HPC cluster, the scripts handle environment activation automatically and you can skip this step.
 
 ## Installation
 
@@ -69,7 +71,7 @@ If `CUDA.functional()` returns `false`, check:
 ## Running the examples
 
 ```bash
-julia --project=. --threads=4 -e 'include("examples/DICG_Cube.jl")'
+julia --project=. -e 'include("examples/DICG_Cube.jl")'
 ```
 
 ## Troubleshooting
