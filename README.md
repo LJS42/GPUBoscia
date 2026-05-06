@@ -34,7 +34,7 @@ export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 ```bash
 conda activate julia_cuda
-julia --project=. --threads=4 -e 'include("examples/DICG_Cube.jl")'
+julia --project=. -e 'include("examples/DICG_Cube.jl")'
 ```
 
 If you are using the provided SLURM scripts to run on an HPC cluster, the scripts handle environment activation automatically and you can skip this step.
