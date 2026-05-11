@@ -342,7 +342,7 @@ version = "0.6.4"
     ProximalOperators = "a725b495-10eb-56fe-b38b-717eba820537"
 
 [[deps.FrankWolfe_GPU]]
-deps = ["Adapt", "Boscia", "CUDA", "FrankWolfe"]
+deps = ["Adapt", "Bonobo", "Boscia", "CUDA", "FrankWolfe"]
 path = "."
 uuid = "f61b46b7-2d62-4d5a-a584-924aca250903"
 version = "0.1.0"

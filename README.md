@@ -7,9 +7,24 @@ GPU-accelerated Branch-and-Bound with Frank-Wolfe methods, built on top of [Bosc
 ### Hardware
 - An NVIDIA GPU is **required**. There is currently no CPU fallback.
 
+## In Cluster
+
+Use the following command to allocate a GPU node and start an interactive shell:
+
+```bash
+salloc --partition=gpu --gres=gpu:1 --cpus-per-task=1 --mem=64G --time=02:00:00
+srun --pty bash
+```
+
+This will request:
+1 NVIDIA GPU
+1 CPU cores
+64 GB memory
+2 hours of wall time
+
 ### Software
 - Julia ≥ 1.9
-- A working NVIDIA driver (check with `nvidia-smi`)
+- A working NVIDIA driver (check with `nvidia-smi`, normally it should be on the cluster.)
 - CUDA toolkit 12.6 (managed automatically by CUDA.jl, but the driver must be installed at the system level)
 
 ## Environment Setup

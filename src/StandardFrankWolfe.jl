@@ -10,7 +10,7 @@ function Boscia.solve_frank_wolfe(
     active_set;
     line_search::FrankWolfe.LineSearchMethod=FrankWolfe.Secant(),
     epsilon=1e-7,
-    max_iteration=200,
+    max_iteration=10000,
     add_dropped_vertices=false,
     use_extra_vertex_storage=false,
     extra_vertex_storage=nothing,
@@ -30,6 +30,7 @@ function Boscia.solve_frank_wolfe(
         managed_lmo,
         active_set,
         pre_computed_set,
+        grad!,
     )
     dim = length(x0)
     pre_computed_set = Vector{Vector{Float64}}()
@@ -57,7 +58,7 @@ function Boscia.solve_frank_wolfe(
     # ── Main loop ─────────────────────────────────────────
     diff_gpu = CUDA.zeros(Float32, dim)
     gap_cpu  = Ref(Inf32) 
-    check_interval = 10000
+    check_interval = 100
 
     prev_gap = Inf32
     gap_ready = false
@@ -98,6 +99,7 @@ function Boscia.solve_frank_wolfe(
     launch_kernel!(v_gpu, blmo.lmo, g_gpu, eff_lb_gpu, eff_ub_gpu, threads, blocks)
     dual_gap = Float64(dot(x_gpu .- v_gpu, g_gpu))
     x_out    = Float64.(Array(x_gpu))
+    map!(v -> v == 0.0 ? 0.0 : v, x_out, x_out)
     primal   = f(x_out)
  
     # ── Return ────────────────────────────────────────────
