@@ -11,6 +11,7 @@ include("../src/Branching_nodes.jl")
 include("../src/BLMO.jl")
 include("../src/Managed_blmo.jl")
 include("../src/Initialize.jl")
+include("../src/Linesearch.jl")
 include("../src/StandardFrankWolfe.jl")
 include("../src/DICG.jl")
 
@@ -29,18 +30,25 @@ const Y = rand(rng, Float32, n, m)
 const Y_gpu = CuArray(Y)
 
 int_vars = collect(1:n*n)
-lbs = fill(-128.0, n*n)
-ubs = fill(128.0, n*n)
+lbs = fill(-8.0, n*n)
+ubs = fill(7.0, n*n)
 
 blmo = Boscia.CubeLMO(lbs, ubs, int_vars)
 lmo = Boscia.ManagedBoundedLMO(blmo, lbs, ubs, int_vars, n*n)
 
 const F_buf_cpu = zeros(Float32, n, m)
+const F_buf_gpu = CUDA.zeros(Float32, n, m)
 
 function f(w)
-    mul!(F_buf_cpu, reshape(w, n, n), X)
-    @. F_buf_cpu -= Y
-    return sum(abs2, F_buf_cpu)
+    if w isa CuArray
+        mul!(F_buf_gpu, reshape(w, n, n), X_gpu)
+        @. F_buf_gpu -= Y_gpu
+        return sum(abs2, F_buf_gpu)
+    else
+        mul!(F_buf_cpu, reshape(w, n, n), X)
+        @. F_buf_cpu -= Y
+        return sum(abs2, F_buf_cpu)
+    end
 end
 
 const R_buf_gpu = CUDA.zeros(Float32, n, m)
@@ -66,7 +74,8 @@ variant = DecompositionInvariantConditionalGradientGPU(256)
 # ── Solve ──────────────────────────────────────────────
 settings = Boscia.create_default_settings()
 settings.branch_and_bound[:verbose] = true
-settings.branch_and_bound[:print_iter] = 500
-settings.branch_and_bound[:time_limit] = 3000
+settings.branch_and_bound[:print_iter] = 50
+settings.branch_and_bound[:time_limit] = 3600
 settings.frank_wolfe[:variant] = variant
+settings.frank_wolfe[:line_search] = GPUSecant()
 x, _, _ = Boscia.solve(f, grad!, lmo, settings=settings)

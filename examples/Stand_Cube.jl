@@ -11,6 +11,7 @@ include("../src/Branching_nodes.jl")
 include("../src/BLMO.jl")
 include("../src/Managed_blmo.jl")
 include("../src/Initialize.jl")
+include("../src/Linesearch.jl")
 include("../src/StandardFrankWolfe.jl")
 
 println("\nNonlinear Example - GPU")
@@ -28,8 +29,8 @@ const Y = rand(rng, Float32, n, m)
 const Y_gpu = CuArray(Y)
 
 int_vars = collect(1:n*n)
-lbs = fill(-128.0, n*n)
-ubs = fill(128.0, n*n)
+lbs = fill(-8.0, n*n)
+ubs = fill(7.0, n*n)
 
 blmo = Boscia.CubeLMO(lbs, ubs, int_vars)
 lmo = Boscia.ManagedBoundedLMO(blmo, lbs, ubs, int_vars, n*n)
@@ -62,7 +63,6 @@ variant = StandardFrankWolfeGPU(256)
 # ── Solve ──────────────────────────────────────────────
 
 settings = Boscia.create_default_settings()
-settings.branch_and_bound[:verbose] = true
 settings.branch_and_bound[:print_iter] = 500
 settings.branch_and_bound[:time_limit] = 1200
 settings.frank_wolfe[:variant] = variant

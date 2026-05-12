@@ -2,7 +2,7 @@
 #SBATCH --job-name=dicg_cube_test
 #SBATCH --partition=gpu
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=1
 #SBATCH --mem=64G
 #SBATCH --time=0-02:00:00
 #SBATCH --output=/home/htc/jili/SCRATCH/bnb_fw_tests/%j.log
@@ -73,10 +73,7 @@ julia --project=. -e "
 # ── 7. Run DICG_Cube ─────────────────────────────────────
 echo ""
 echo "── Running DICG_Cube.jl ─────────────────"
-julia --project=. \
-      --threads=4 \
-      examples/DICG_Cube.jl
-TEST_EXIT=$?
+julia --project=. -e 'include("examples/DICG_Cube.jl")'
 
 echo ""
 echo "════════════════════════════════════════"

@@ -8,9 +8,9 @@ function Boscia.solve_frank_wolfe(
     grad!,
     managed_lmo,
     active_set;
-    line_search::FrankWolfe.LineSearchMethod=FrankWolfe.Secant(),
+    line_search::FrankWolfe.LineSearchMethod=GPUSecant(),
     epsilon=1e-7,
-    max_iteration=10000,
+    max_iteration=2222,
     add_dropped_vertices=false,
     use_extra_vertex_storage=false,
     extra_vertex_storage=nothing,
@@ -55,13 +55,15 @@ function Boscia.solve_frank_wolfe(
     eff_lb_gpu, eff_ub_gpu = build_effective_bounds(blmo, dim)
     v_gpu = CUDA.zeros(Float32, dim)
     a_gpu = CUDA.zeros(Float32, dim)
-    d_gpu= CUDA.zeros(Float32, dim)
+    d_gpu = CUDA.zeros(Float32, dim)
     gamma_gpu = CUDA.fill(reinterpret(UInt32, Inf32), 1)
+
+    ls_workspace = FrankWolfe.build_linesearch_workspace(line_search, x_gpu, g_gpu)
  
     # ── Main loop ─────────────────────────────────────────
     diff_gpu = CUDA.zeros(Float32, dim)
     gap_cpu  = Ref(Inf32) 
-    check_interval = 10000
+    check_interval = 111
 
     prev_gap = Inf32
     gap_ready = false
@@ -74,7 +76,8 @@ function Boscia.solve_frank_wolfe(
         grad!(g_gpu, x_gpu)
         launch_kernel_DICG!(v_gpu, a_gpu, d_gpu, gamma_gpu, blmo.lmo, g_gpu, x_gpu, eff_lb_gpu, eff_ub_gpu, threads, blocks)
         γ_max = reinterpret(Float32, CUDA.@allowscalar gamma_gpu[1])
-        γ = min(2f0 / Float32(k + 2), γ_max)
+        gamma = FrankWolfe.perform_line_search(line_search, k, f, grad!, g_gpu, x_gpu, d_gpu, γ_max, ls_workspace)
+        γ = min(gamma, γ_max)
         x_gpu .= x_gpu .- γ .* d_gpu
 
         if mod(k, check_interval) == 0
@@ -110,6 +113,7 @@ function Boscia.solve_frank_wolfe(
     launch_kernel!(v_gpu, blmo.lmo, g_gpu, eff_lb_gpu, eff_ub_gpu, threads, blocks)
     dual_gap = Float64(dot(x_gpu .- v_gpu, g_gpu))
     x_out    = Float64.(Array(x_gpu))
+    map!(v -> v == 0.0 ? 0.0 : v, x_out, x_out)
     primal   = f(x_out)
  
     # ── Return ────────────────────────────────────────────

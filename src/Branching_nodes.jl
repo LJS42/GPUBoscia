@@ -4,6 +4,14 @@ based on their parent and the index of the branching variable
 """
 function Bonobo.get_branching_nodes_info(tree::Bonobo.BnBTree, node::Boscia.FrankWolfeNode, vidx::Int)
     if !Boscia.is_valid_split(tree, vidx)
+        tlmo = tree.root.problem.tlmo
+        managed_lmo = tlmo.lmo
+        idx = findfirst(x -> x == vidx, managed_lmo.int_vars)
+        @show vidx
+        @show managed_lmo.lower_bounds[idx]
+        @show managed_lmo.upper_bounds[idx]
+        x = Bonobo.get_relaxed_values(tree, node)
+        @show x[vidx]
         error("Splitting on the same index as parent! Abort!")
     end
 
