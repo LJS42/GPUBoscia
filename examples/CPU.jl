@@ -2,37 +2,26 @@ using LinearAlgebra
 using Random
 using Boscia
 using StableRNGs
-using SCIP
 using FrankWolfe
-import MathOptInterface
-
-const MOI = MathOptInterface
 
 
-seed = rand(UInt64)
+seed = 0x5dd2363d3e3d4329
 @show seed
 rng = StableRNG(seed)
 
 # ── data ──────────────────────────────────────────
-n = 8
-m = 70000
+n = 128
+m = 700
 
 const X = rand(rng, Float32, n, m)
 const Y = rand(rng, Float32, n, m)
 
 int_vars = collect(1:n*n)
-lbs = fill(-128.0, n*n)
-ubs = fill(128.0, n*n)
+lbs = fill(-8.0, n*n)
+ubs = fill(7.0, n*n)
 
 blmo = Boscia.CubeLMO(lbs, ubs, int_vars)
 lmo = Boscia.ManagedBoundedLMO(blmo, lbs, ubs, int_vars, n*n)
-
-int_vars = collect(1:n)
-lbs = fill(0.0, n)
-ubs = fill(1.0, n)
-
-blmo = Boscia.CubeLMO(lbs, ubs, int_vars)
-lmo = Boscia.ManagedBoundedLMO(blmo, lbs, ubs, int_vars, n)
 
 # ── obj ──────────────────────────────────────
 function f(w)
@@ -59,13 +48,14 @@ end
 #     @. storage = x-diffw
 # end
 
-# variant = Boscia.StandardFrankWolfe()
+variant = Boscia.DecompositionInvariantConditionalGradient()
 
 # ── Solve ──────────────────────────────────────────────
 settings = Boscia.create_default_settings()
 settings.branch_and_bound[:verbose] = true
-settings.branch_and_bound[:print_iter] = 500
-settings.branch_and_bound[:time_limit] = 1200
+settings.branch_and_bound[:print_iter] = 50
+settings.branch_and_bound[:time_limit] = 3600
+settings.frank_wolfe[:max_fw_iter] = 222222
 settings.frank_wolfe[:variant] = variant
 
 x, _, _ = Boscia.solve(f, grad!, lmo, settings=settings)

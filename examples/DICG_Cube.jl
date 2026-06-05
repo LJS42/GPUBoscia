@@ -5,6 +5,7 @@ using Random
 using Boscia
 using Bonobo
 using CUDA
+using Printf
 #CUDA.set_runtime_version!(v"12.6")
 using StableRNGs
 include("../src/Branching_nodes.jl")
@@ -17,16 +18,21 @@ include("../src/DICG.jl")
 
 println("\nNonlinear Example - GPU")
 seed = rand(UInt64)
+#0x5dd2363d3e3d4329
 @show seed
 rng = StableRNG(seed)
 
 # ── obj ──────────────────────────────────────────
-n = 256
-m = 70000
+n = 64
+m = 100
 
-const X = rand(rng, Float32, n, m)
-const X_gpu = CuArray(X)
-const Y = rand(rng, Float32, n, m)
+X_raw = rand(rng, Float64, n, m)
+# C = X_raw * X_raw' / m      # variance
+# W = inv(sqrt(C))             # whiten
+# const X = W * X_raw          
+const X = rand(rng, Float64, n, m) .* 2.0 .- 1.0
+const X_gpu = CuArray(Float32.(X))
+const Y = rand(rng, Float32, n, m) .* 6.0 .- 3.0
 const Y_gpu = CuArray(Y)
 
 int_vars = collect(1:n*n)
@@ -78,4 +84,5 @@ settings.branch_and_bound[:print_iter] = 50
 settings.branch_and_bound[:time_limit] = 3600
 settings.frank_wolfe[:variant] = variant
 settings.frank_wolfe[:line_search] = GPUSecant()
+settings.frank_wolfe[:max_fw_iter] = 10000
 x, _, _ = Boscia.solve(f, grad!, lmo, settings=settings)

@@ -16,7 +16,7 @@ struct GPUSecant <: FrankWolfe.LineSearchMethod
 end
 
 function GPUSecant(;
-    limit_num_steps = 40,
+    limit_num_steps = 3,
     tol             = 1e-6,
     gamma_max       = 1f0,
 )
@@ -44,6 +44,77 @@ function FrankWolfe.build_linesearch_workspace(
     )
 end
 
+# function FrankWolfe.perform_line_search(
+#     ls        :: GPUSecant,
+#     _,
+#     f,
+#     grad!,
+#     gradient  :: CuArray,
+#     x         :: CuArray,
+#     d         :: CuArray,
+#     gamma_max :: Real,
+#     workspace :: GPUSecantWorkspace,
+# )
+#     # ── exact copy of Secant, GPU ops only ───────────────────────────────────
+
+#     dot_gdir = dot(gradient, d)
+#     gamma = gamma_max
+
+#     workspace.storage .= x .- gamma .* d
+
+#     best_gamma = gamma
+#     best_val   = f(workspace.storage)
+#     i          = 1
+#     gamma_prev = zero(gamma)
+#     clamping   = false
+
+#     if dot_gdir <= ls.tol
+#         return zero(gamma)
+#     end
+
+#     while abs(dot_gdir) > ls.tol
+#         if i > ls.limit_num_steps
+#             workspace.last_gamma = best_gamma
+#             break
+#         end
+
+#         # GPU matmul
+#         grad!(workspace.grad_storage, workspace.storage)
+
+#         # GPU reduction → one scalar pull
+#         dot_gdir_new = dot(workspace.grad_storage, d)
+
+#         if abs(dot_gdir_new - dot_gdir) < 1f-3
+#             clamping = true
+#             workspace.last_gamma = best_gamma
+#             break
+#         end
+
+#         # secant update — same formula as original
+#         gamma_new  = gamma - dot_gdir_new * (gamma - gamma_prev) / (dot_gdir_new - dot_gdir)
+#         gamma_prev = gamma
+#         gamma      = clamp(gamma_new, 0, gamma_max)
+#         @show dot_gdir_new, dot_gdir
+
+#         # GPU update
+#         workspace.storage .= x .- gamma .* d
+#         new_val = f(workspace.storage)
+
+#         if new_val < best_val
+#             best_val   = new_val
+#             best_gamma = gamma
+#         end
+
+#         dot_gdir = dot_gdir_new
+#         i += 1
+#     end
+
+#     workspace.last_gamma = best_gamma
+#     @best_gamma
+#     return best_gamma
+# end
+
+#just for quad
 function FrankWolfe.perform_line_search(
     ls        :: GPUSecant,
     _,
@@ -57,58 +128,23 @@ function FrankWolfe.perform_line_search(
 )
     # ── exact copy of Secant, GPU ops only ───────────────────────────────────
 
-    dot_gdir = dot(gradient, d)
-    gamma = min(workspace.last_gamma, gamma_max)
+    dot_gdir = Float64(dot(gradient, d))
+    gamma = gamma_max * 1e-5
 
-    # initial storage = x + gamma * d  (GPU, replaces muladd_memory_mode)
     workspace.storage .= x .- gamma .* d
 
-    best_gamma = gamma
     best_val   = f(workspace.storage)
-    i          = 1
     gamma_prev = zero(gamma)
-    clamping   = false
 
-    if dot_gdir <= ls.tol
-        return zero(gamma)
-    end
+    # GPU matmul
+    grad!(workspace.grad_storage, workspace.storage)
 
-    while abs(dot_gdir) > ls.tol
-        if i > ls.limit_num_steps
-            workspace.last_gamma = best_gamma
-            break
-        end
+    dot_gdir_new = Float64(dot(workspace.grad_storage, d))
 
-        # GPU matmul
-        grad!(workspace.grad_storage, workspace.storage)
+    # secant update — same formula as original
+    gamma_new  = gamma - dot_gdir_new * (gamma - gamma_prev) / (dot_gdir_new - dot_gdir)
+    gamma_best      = min(gamma_new, gamma_max)
 
-        # GPU reduction → one scalar pull
-        dot_gdir_new = dot(workspace.grad_storage, d)
-
-        if dot_gdir_new ≈ dot_gdir
-            clamping = true
-            workspace.last_gamma = best_gamma
-            break
-        end
-
-        # secant update — same formula as original
-        gamma_new  = gamma - dot_gdir_new * (gamma - gamma_prev) / (dot_gdir_new - dot_gdir)
-        gamma_prev = gamma
-        gamma      = clamp(gamma_new, 0, gamma_max)
-
-        # GPU update
-        workspace.storage .= x .- gamma .* d
-        new_val = f(workspace.storage)
-
-        if new_val < best_val
-            best_val   = new_val
-            best_gamma = gamma
-        end
-
-        dot_gdir = dot_gdir_new
-        i += 1
-    end
-
-    workspace.last_gamma = best_gamma
-    return best_gamma
+    # gamma_best
+    return gamma_best
 end

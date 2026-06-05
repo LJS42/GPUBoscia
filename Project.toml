@@ -13,7 +13,7 @@ FrankWolfe = "f55ce6ea-fdc5-4628-88c5-0087fe54bd30"
 [compat]
 Adapt = "4.5.2"
 Bonobo = "0.1.5"
-Boscia = "0.2.10"
+Boscia = "0.2.12"
 CUDA = "6.0.0"
 FrankWolfe = "0.6.4"
 

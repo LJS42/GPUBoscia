@@ -11,6 +11,7 @@ include("./Branching_nodes.jl")
 include("./BLMO.jl")
 include("./Managed_blmo.jl")
 include("./Initialize.jl")
+include("./Linesearch.jl")
 include("./StandardFrankWolfe.jl")
 include("./DICG.jl")
 

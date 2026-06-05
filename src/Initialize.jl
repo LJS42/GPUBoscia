@@ -13,23 +13,11 @@ function gpu_start_point_initialize(
         x0 = sum(pre_computed_set) / length(pre_computed_set)
     end
 
-    lb = lmo.lmo.lower_bounds
-    ub = lmo.lmo.upper_bounds
-    int_vars = lmo.lmo.lmo.int_vars
+    lb = max.(lmo.lmo.lmo.lower_bounds, lmo.lmo.lower_bounds)
+    ub = min.(lmo.lmo.lmo.upper_bounds, lmo.lmo.upper_bounds)
+    int_vars = lmo.int_vars
     for (idx, i) in enumerate(int_vars)
         x0[i] = clamp(x0[i], lb[idx], ub[idx])
-    end
-
-    if !Boscia.is_linear_feasible(lmo, x0)
-        g = zeros(length(x0))
-        grad!(g, x0)
-        x0 = Boscia.bounded_compute_extreme_point(
-        lmo.lmo.lmo,
-        g,
-        lmo.lmo.lower_bounds,
-        lmo.lmo.upper_bounds,
-        lmo.lmo.int_vars,
-    )
     end
 
     return x0
