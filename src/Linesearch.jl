@@ -129,7 +129,7 @@ function FrankWolfe.perform_line_search(
     # ── exact copy of Secant, GPU ops only ───────────────────────────────────
 
     dot_gdir = Float64(dot(gradient, d))
-    gamma = gamma_max * 1e-5
+    gamma = gamma_max * 1e-2
 
     workspace.storage .= x .- gamma .* d
 
@@ -145,8 +145,9 @@ function FrankWolfe.perform_line_search(
     gamma_new  = gamma - dot_gdir_new * (gamma - gamma_prev) / (dot_gdir_new - dot_gdir)
     gamma_best      = min(gamma_new, gamma_max)
 
-    if gamma_best == NaN
-        gamma_best = gamma_max * 1e-1
+    if if isnan(gamma_best) || isinf(gamma_best) || gamma_best < 0
+        gamma_best = gamma_max * 1e-4
+    end
 
     # gamma_best
     return gamma_best
