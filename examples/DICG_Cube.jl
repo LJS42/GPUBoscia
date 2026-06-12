@@ -23,56 +23,87 @@ seed = rand(UInt64)
 rng = StableRNG(seed)
 
 # ── obj ──────────────────────────────────────────
-n = 64
-m = 100
+n = 8
+m = 7000
+const W_float = randn(rng, Float32, n, n)
+const X       = rand(rng, Float32, n, m)
+const Y       = W_float * X .+ 0.01f0 * randn(rng, Float32, n, m)
+const X_gpu   = CuArray(X)
+const Y_gpu   = CuArray(Y)
 
-X_raw = rand(rng, Float64, n, m)
-# C = X_raw * X_raw' / m      # variance
-# W = inv(sqrt(C))             # whiten
-# const X = W * X_raw          
-const X = rand(rng, Float64, n, m) .* 2.0 .- 1.0
-const X_gpu = CuArray(Float32.(X))
-const Y = rand(rng, Float32, n, m) .* 6.0 .- 3.0
-const Y_gpu = CuArray(Y)
+const QMIN       = 0.0
+const QMAX       = 15.0
+const NUM_LEVELS = QMAX - QMIN + 1
 
 int_vars = collect(1:n*n)
-lbs = fill(-8.0, n*n)
-ubs = fill(7.0, n*n)
+lbs      = fill(QMIN, n*n)
+ubs      = fill(QMAX, n*n)
+
+const w_min = Float64(minimum(W_float))
+const w_max = Float64(maximum(W_float))
+const scale = (w_max - w_min) / (NUM_LEVELS - 1)
 
 blmo = Boscia.CubeLMO(lbs, ubs, int_vars)
-lmo = Boscia.ManagedBoundedLMO(blmo, lbs, ubs, int_vars, n*n)
+lmo  = Boscia.ManagedBoundedLMO(blmo, lbs, ubs, int_vars, n*n)
 
-const F_buf_cpu = zeros(Float32, n, m)
-const F_buf_gpu = CUDA.zeros(Float32, n, m)
+const R_buf_f_gpu = CUDA.zeros(Float32, n, m)
+const R_buf_g_gpu = CUDA.zeros(Float32, n, m)
+const G_buf_gpu   = CUDA.zeros(Float32, n, n)
+const R_buf_f = zeros(Float32, n, m)
+const R_buf_g = zeros(Float32, n, m)
+const G_buf   = zeros(Float32, n, n)
 
-function f(w)
-    if w isa CuArray
-        mul!(F_buf_gpu, reshape(w, n, n), X_gpu)
-        @. F_buf_gpu -= Y_gpu
-        return sum(abs2, F_buf_gpu)
+const q_buf_gpu = CUDA.zeros(Float32, n*n)
+
+function dequantize(q_vec)
+    if q_vec isa CuArray
+        return Float32(scale) .* reshape(q_vec, n, n) .+ Float32(w_min)
     else
-        mul!(F_buf_cpu, reshape(w, n, n), X)
-        @. F_buf_cpu -= Y
-        return sum(abs2, F_buf_cpu)
+        return Float32(scale) .* reshape(q_vec, n, n) .+ Float32(w_min)
     end
 end
 
-const R_buf_gpu = CUDA.zeros(Float32, n, m)
-const R_buf_cpu = zeros(Float32, n, m)
-
-function grad!(storage, w)
-    if w isa CuArray
-        mul!(R_buf_gpu, reshape(w, n, n), X_gpu)
-        @. R_buf_gpu -= Y_gpu
-        mul!(reshape(storage, n, n), R_buf_gpu, X_gpu')
-        @. storage *= 2f0
+function f(q)
+    W_q = dequantize(q)
+    if W_q isa CuArray
+        mul!(R_buf_f_gpu, W_q, X_gpu)
+        @. R_buf_f_gpu -= Y_gpu
+        return Float64(sum(abs2, R_buf_f_gpu)) / (n * m)  
     else
-        mul!(R_buf_cpu, reshape(w, n, n), X)
-        @. R_buf_cpu -= Y
-        mul!(reshape(storage, n, n), R_buf_cpu, X')
-        @. storage *= 2f0
+        mul!(R_buf_f, W_q, X)
+        @. R_buf_f -= Y
+        return Float64(sum(abs2, R_buf_f)) / (n * m)        
     end
 end
+
+function grad!(storage, q)
+    W_q = dequantize(q)
+    if W_q isa CuArray
+        mul!(R_buf_g_gpu, W_q, X_gpu)
+        @. R_buf_g_gpu -= Y_gpu
+        mul!(G_buf_gpu, R_buf_g_gpu, X_gpu')
+        @. G_buf_gpu *= Float32(2.0 * scale / (n * m))
+        storage .= vec(G_buf_gpu) 
+    else
+        mul!(R_buf_g, W_q, X)
+        @. R_buf_g -= Y
+        mul!(G_buf, R_buf_g, X')
+        @. G_buf *= Float32(2.0 * scale / (n * m))
+        storage .= Float64.(vec(G_buf))
+    end
+end
+
+# function my_start_point(lmo, active_set)
+#     x0  = FrankWolfe.get_active_set_iterate(active_set)
+#     dim = length(x0)
+#     g   = zeros(Float64, dim)
+#     grad!(g, x0)
+#     v        = FrankWolfe.compute_extreme_point(lmo, g)
+#     dual_gap = dot(g, x0 - v)
+#     primal   = f(x0)
+#     dual     = primal - dual_gap
+#     return v, dual
+# end
 
 # ── GPU variant ───────────────────────────────────────
 variant = DecompositionInvariantConditionalGradientGPU(256)
@@ -81,7 +112,7 @@ variant = DecompositionInvariantConditionalGradientGPU(256)
 settings = Boscia.create_default_settings()
 settings.branch_and_bound[:verbose] = true
 settings.branch_and_bound[:print_iter] = 50
-settings.branch_and_bound[:time_limit] = 3600
+settings.branch_and_bound[:time_limit] = 7200
 settings.frank_wolfe[:variant] = variant
 settings.frank_wolfe[:line_search] = GPUSecant()
 settings.frank_wolfe[:max_fw_iter] = 10000

@@ -133,7 +133,7 @@ function FrankWolfe.perform_line_search(
 
     workspace.storage .= x .- gamma .* d
 
-    best_val   = f(workspace.storage)
+    # best_val   = f(workspace.storage)
     gamma_prev = zero(gamma)
 
     # GPU matmul
@@ -144,6 +144,9 @@ function FrankWolfe.perform_line_search(
     # secant update — same formula as original
     gamma_new  = gamma - dot_gdir_new * (gamma - gamma_prev) / (dot_gdir_new - dot_gdir)
     gamma_best      = min(gamma_new, gamma_max)
+
+    if gamma_best == NaN
+        gamma_best = gamma_max * 1e-1
 
     # gamma_best
     return gamma_best

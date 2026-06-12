@@ -2,23 +2,21 @@ function gpu_start_point_initialize(
     lmo::Boscia.TimeTrackingLMO,
     active_set::FrankWolfe.ActiveSet,
     pre_computed_set,
+    lb,
+    ub,
+    threads,
+    blocks
 )
-    if lmo.ncalls == 0
-        return Float64.(FrankWolfe.get_active_set_iterate(active_set))
-    end
-
-    if pre_computed_set === nothing || isempty(pre_computed_set)
-        x0 = Float64.(FrankWolfe.get_active_set_iterate(active_set))
-    else
-        x0 = sum(pre_computed_set) / length(pre_computed_set)
-    end
-
-    lb = max.(lmo.lmo.lmo.lower_bounds, lmo.lmo.lower_bounds)
-    ub = min.(lmo.lmo.lmo.upper_bounds, lmo.lmo.upper_bounds)
-    int_vars = lmo.int_vars
-    for (idx, i) in enumerate(int_vars)
-        x0[i] = clamp(x0[i], lb[idx], ub[idx])
-    end
-
-    return x0
+    x0 = FrankWolfe.get_active_set_iterate(active_set)
+    x0_gpu = CuArray(Float32.(x0))
+    dim = length(x0)
+    g_gpu = CUDA.zeros(Float32, dim)
+    v_gpu = CUDA.zeros(Float32, dim)
+    grad!(g_gpu, x0_gpu)
+    launch_kernel!(v_gpu, lmo.lmo.lmo, g_gpu, lb, ub, threads, blocks)
+    # dual_gap = dot(g, x0 - v)
+    # primal = f(x0)
+    # dual = primal - dual_gap
+    # @info "primal: $primal, dual gap: $dual_gap, lower bound: $dual"
+    return v_gpu
 end

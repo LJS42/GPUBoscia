@@ -9,7 +9,7 @@ struct DecompositionInvariantConditionalGradientGPU <: Boscia.DecompositionInvar
         use_strong_lazy       = false,
         use_warm_start        = false,
         use_strong_warm_start = false,
-    ) = new(threads, print_iter, check_interval, use_strong_lazy, use_warm_start, use_strong_warm_start)
+    ) = new(threads, check_interval, use_strong_lazy, use_warm_start, use_strong_warm_start)
 end
 
 function Boscia.solve_frank_wolfe(
@@ -19,8 +19,8 @@ function Boscia.solve_frank_wolfe(
     managed_lmo,
     active_set;
     line_search::FrankWolfe.LineSearchMethod=GPUSecant(),
-    epsilon=1e-7,
-    max_iteration=22222,
+    epsilon=1e-4,
+    max_iteration=2222,
     add_dropped_vertices=false,
     use_extra_vertex_storage=false,
     extra_vertex_storage=nothing,
@@ -34,8 +34,20 @@ function Boscia.solve_frank_wolfe(
     kwargs...,
 )
     # ── Setup ─────────────────────────────────────────────
-    x0  = gpu_start_point_initialize(managed_lmo, active_set, pre_computed_set)
+
+    x0 = FrankWolfe.get_active_set_iterate(active_set)
+
     dim = length(x0)
+
+    threads        = frank_wolfe_variant.threads
+    check_interval = frank_wolfe_variant.check_interval
+    blocks         = cld(dim, threads)
+
+    blmo     = managed_lmo.lmo
+
+    eff_lb_gpu, eff_ub_gpu = build_effective_bounds(blmo, dim)
+
+    x_gpu  = gpu_start_point_initialize(managed_lmo, active_set, pre_computed_set, eff_lb_gpu, eff_ub_gpu, threads, blocks)
 
     pre_computed_set = Vector{Vector{Float64}}()
 
@@ -45,22 +57,18 @@ function Boscia.solve_frank_wolfe(
 
     threads        = frank_wolfe_variant.threads
     check_interval = frank_wolfe_variant.check_interval
-    blocks         = cld(dim, threads)
     blocks_pow2    = nextpow(2, blocks)
 
     shmem_reduce = threads     * sizeof(Float32)
     shmem_check  = blocks_pow2 * sizeof(Float32)
 
-    x_gpu    = CuArray(Float32.(x0))
     g_gpu    = CUDA.zeros(Float32, dim)
     gap_gpu  = CUDA.zeros(Float32, 1)
     diff_gpu = CUDA.zeros(Float32, dim)
-    blmo     = managed_lmo.lmo
 
     status = :MAXITER
     k      = 0
 
-    eff_lb_gpu, eff_ub_gpu = build_effective_bounds(blmo, dim)
     v_gpu     = CUDA.zeros(Float32, dim)
     a_gpu     = CUDA.zeros(Float32, dim)
     d_gpu     = CUDA.zeros(Float32, dim)
@@ -113,6 +121,8 @@ function Boscia.solve_frank_wolfe(
         γ = min(gamma, γ_max)
         x_gpu .= x_gpu .- γ .* d_gpu
 
+        @show γ
+
         # ── Gap check ────────────────────────────────────
         if do_check
             diff_gpu .= x_gpu .- v_gpu
@@ -134,7 +144,7 @@ function Boscia.solve_frank_wolfe(
             # ── Callback (Incumbent update) ───────────────
             if callback !== nothing
                 CUDA.@allowscalar gap_val = Float64(gap_gpu[1])
-                primal_val = Float64(f(x_gpu))
+                primal_val = f(x_gpu)
                 tot_time   = (time_ns() - time_start) / 1e9
                 v_out = Float64.(Array(v_gpu))
                 g_out = Float64.(Array(g_gpu))
@@ -176,7 +186,10 @@ function Boscia.solve_frank_wolfe(
     dual_gap  = Float64(dot(diff_gpu, g_gpu))
     x_out     = Float64.(Array(x_gpu))
     map!(v -> v == 0.0 ? 0.0 : v, x_out, x_out)
-    primal    = Float64(f(x_gpu))
+    primal    = f(x_gpu)
+
+    @show primal
+    @show dual_gap
 
     # ── Final callback ────────────────────────────────────
     if callback !== nothing
