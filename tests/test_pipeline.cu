@@ -643,7 +643,9 @@ void run_device_resident_case(const char* name,
                               const std::vector<double>& lb,
                               const std::vector<double>& ub,
                               int batch_size,
-                              int num_streams)
+                              int num_streams,
+                              DeviceResidentConfig::DICGOracleParallelism mode =
+                                  DeviceResidentConfig::DICGOracleParallelism::Auto)
 {
     std::cout << "\n[" << name << " — device-resident global-Q]\n";
 
@@ -660,9 +662,11 @@ void run_device_resident_case(const char* name,
 
     bool threw = false;
     try {
+        auto cfg = make_device_cfg(batch_size, num_streams);
+        cfg.dicg_oracle_parallelism = mode;
         DeviceResidentHybridSolver<Objective, Algorithm>
             solver(prob, obj, Algorithm{}, make_branch_fn(),
-                   make_device_cfg(batch_size, num_streams));
+                   cfg);
 
         Node root(0, -1, 0, lb, ub);
         root.dual_bound = -1e300;
@@ -673,6 +677,9 @@ void run_device_resident_case(const char* name,
                   << "  found = " << solver.incumbent_value() << "\n";
         EXPECT_NEAR(solver.incumbent_value(), f_true, 0.02,
                     "device-resident incumbent within 0.02 of true optimum");
+        if (mode == DeviceResidentConfig::DICGOracleParallelism::Paired)
+            EXPECT(solver.paired_gpu_batches() > 0,
+                   "forced paired DICG launched a paired GPU batch");
     } catch (const std::exception& e) {
         std::cerr << "  EXCEPTION: " << e.what() << "\n";
         threw = true;
@@ -783,12 +790,14 @@ void test_dicg_box_device_resident_n4() {
     const std::vector<double> lb = {-1.0, -1.0, -1.0, -1.0};
     const std::vector<double> ub = { 4.0,  4.0,  4.0,  4.0};
     run_device_resident_case<4, DICGPolicy>(
-        "DICG BoxLMO correctness n=4", c, lb, ub, 16, 2);
+        "DICG BoxLMO paired correctness n=4", c, lb, ub, 16, 2,
+        DeviceResidentConfig::DICGOracleParallelism::Paired);
     run_device_resident_case<4, DICGSafeguardedScaledOpenLoop>(
         "DICG safeguarded scaled open-loop regression n=4",
         c, lb, ub, 16, 2);
     run_device_resident_case<4, DICGSecant>(
-        "DICG secant regression n=4", c, lb, ub, 16, 2);
+        "DICG paired secant regression n=4", c, lb, ub, 16, 2,
+        DeviceResidentConfig::DICGOracleParallelism::Paired);
 }
 
 void test_simplex_lmo_device_resident_n4() {
@@ -826,9 +835,12 @@ void test_simplex_lmo_device_resident_n4() {
     EXPECT(satisfies_simplex(solver.incumbent_x(), rhs),
            "device-resident simplex incumbent satisfies sum(x) <= rhs");
 
+    auto dicg_cfg = make_device_cfg(16, 2);
+    dicg_cfg.dicg_oracle_parallelism =
+        DeviceResidentConfig::DICGOracleParallelism::Paired;
     DeviceResidentHybridSolver<Objective, DICGPolicy, UnitSimplexLMO<n>>
         dicg_solver(prob, obj, DICGPolicy{}, make_branch_fn(),
-                    make_device_cfg(16, 2), lmo);
+                    dicg_cfg, lmo);
     Node dicg_root(0, -1, 0, lb, ub); dicg_root.dual_bound = -1e300;
     dicg_solver.push(dicg_root);
     dicg_solver.solve();
@@ -839,7 +851,41 @@ void test_simplex_lmo_device_resident_n4() {
                 "DICG simplex incumbent within 0.02 of true optimum");
     EXPECT(satisfies_simplex(dicg_solver.incumbent_x(), rhs),
            "DICG simplex incumbent satisfies sum(x) <= rhs");
+    EXPECT(dicg_solver.paired_gpu_batches() > 0,
+           "forced paired DICG simplex launched a paired GPU batch");
 
+    cudaFree(d_Q);
+    cudaFree(d_c);
+}
+
+void test_birkhoff_paired_device_resident() {
+    std::cout << "\n[BirkhoffLMO paired device-resident]\n";
+    constexpr int order = 4;
+    constexpr int n = order * order;
+    std::vector<double> target(n, 0.0);
+    for (int r = 0; r < order; ++r)
+        target[r * order + ((r + 1) % order)] = 1.0;
+    const std::vector<double> lb(n, 0.0), ub(n, 1.0);
+    const std::vector<double> Q = identity_matrix(n);
+    double* d_Q = upload_values(Q);
+    double* d_c = upload_values(target);
+    Problem prob = make_problem(n, target, lb, ub);
+    using Objective = ILSGlobalCachedObjective<n>;
+    Objective obj{d_Q, d_c, sumsq(target), Q.data(), target.data()};
+    auto cfg = make_device_cfg(4, 1);
+    cfg.dicg_oracle_parallelism =
+        DeviceResidentConfig::DICGOracleParallelism::Paired;
+    BirkhoffLMO<order> lmo;
+    DeviceResidentHybridSolver<Objective, DICGPolicy, BirkhoffLMO<order>>
+        solver(prob, obj, DICGPolicy{}, make_branch_fn(), cfg, lmo);
+    Node root(0, -1, 0, lb, ub);
+    root.dual_bound = -1e300;
+    solver.push(root);
+    solver.solve();
+    EXPECT(solver.paired_gpu_batches() > 0,
+           "forced paired Birkhoff DICG launched a paired GPU batch");
+    EXPECT_NEAR(solver.incumbent_value(), 0.0, 1e-10,
+                "paired Birkhoff DICG finds the target permutation");
     cudaFree(d_Q);
     cudaFree(d_c);
 }
@@ -857,7 +903,8 @@ static void run_equality_simplex_convergence_case(
     const std::vector<double>& ub,
     double rhs,
     int max_iters,
-    double eps)
+    double eps,
+    bool expect_convergence)
 {
     constexpr int n = 120;
     double* d_Q = upload_values(Q_transposed);
@@ -870,6 +917,10 @@ static void run_equality_simplex_convergence_case(
     DeviceResidentConfig cfg = make_device_cfg(1, 1);
     cfg.gpu_max_iters = max_iters;
     cfg.gpu_eps = eps;
+    // This matrix measures line-search convergence, not oracle scheduling.
+    // Paired execution has separate forced-path regressions.
+    cfg.dicg_oracle_parallelism =
+        DeviceResidentConfig::DICGOracleParallelism::Serial;
 
     BranchStrategy no_branch = [](
         const Node&, int&, const std::vector<double>&,
@@ -894,8 +945,9 @@ static void run_equality_simplex_convergence_case(
            std::string(name) + " returns a finite nonnegative FW gap");
     EXPECT(iterations > 0 && iterations <= max_iters,
            std::string(name) + " reports a valid iteration count");
-    EXPECT(converged,
-           std::string(name) + " converges on equality-simplex quadratic");
+    if (expect_convergence)
+        EXPECT(converged,
+               std::string(name) + " converges on equality-simplex quadratic");
 
     cudaFree(d_Q);
     cudaFree(d_linear);
@@ -966,27 +1018,27 @@ static void test_equality_simplex_algorithm_convergence_matrix()
     run_equality_simplex_convergence_case(
         "FW + open-loop", FrankWolfeOpenLoop{},
         prob, Q, Q_transposed, linear, constant,
-        lb, ub, rhs, max_iters, eps);
+        lb, ub, rhs, max_iters, eps, false);
     run_equality_simplex_convergence_case(
         "FW + secant", FrankWolfeSecant{SecantLS{16, 1e-10, 1e-14}},
         prob, Q, Q_transposed, linear, constant,
-        lb, ub, rhs, max_iters, eps);
+        lb, ub, rhs, max_iters, eps, false);
     run_equality_simplex_convergence_case(
         "DICG + open-loop", DICGOpenLoop{},
         prob, Q, Q_transposed, linear, constant,
-        lb, ub, rhs, max_iters, eps);
+        lb, ub, rhs, max_iters, eps, false);
     run_equality_simplex_convergence_case(
         "DICG + scaled open-loop", DICGScaledOpenLoop{},
         prob, Q, Q_transposed, linear, constant,
-        lb, ub, rhs, max_iters, eps);
+        lb, ub, rhs, max_iters, eps, false);
     run_equality_simplex_convergence_case(
         "DICG + safeguarded scaled", DICGSafeguardedScaledOpenLoop{},
         prob, Q, Q_transposed, linear, constant,
-        lb, ub, rhs, max_iters, eps);
+        lb, ub, rhs, max_iters, eps, true);
     run_equality_simplex_convergence_case(
         "DICG + secant", DICGSecant{SecantLS{16, 1e-10, 1e-14}},
         prob, Q, Q_transposed, linear, constant,
-        lb, ub, rhs, max_iters, eps);
+        lb, ub, rhs, max_iters, eps, true);
 }
 
 struct SecantToleranceProbeResult {
@@ -1097,6 +1149,7 @@ int main() {
         test_device_resident_n8();
         test_dicg_box_device_resident_n4();
         test_simplex_lmo_device_resident_n4();
+        test_birkhoff_paired_device_resident();
         test_equality_simplex_algorithm_convergence_matrix();
         test_secant_tolerance_stall_regression();
     } catch (const std::exception& e) {

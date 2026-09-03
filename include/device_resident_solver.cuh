@@ -36,6 +36,7 @@
 //   and after branching; otherwise it falls back to box feasibility.
 
 #include <cuda_runtime.h>
+#include <cooperative_groups.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -64,6 +65,8 @@
 #include "heuristics.h"
 #include "lmo.cuh"
 #include "node.h"
+
+namespace cg = cooperative_groups;
 #include "problem.h"
 
 #if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
@@ -185,7 +188,7 @@ void drs_fw_relax_batch_kernel(
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     constexpr int work_vectors =
-        2 + (DRSUsesDICG<Algorithm>::value ? 1 : 0)
+        2 + (DRSUsesDICG<Algorithm>::value ? 2 : 0)
           + (Algorithm::uses_secant_line_search ? 2 : 0);
     double* grad = workspace + (size_t)node * work_vectors * n;
     double* v_s  = grad + n;
@@ -427,7 +430,221 @@ void drs_fw_relax_batch_kernel(
     }
 }
 
+// Low-frontier DICG kernel.  A cooperative grid assigns two complete blocks
+// to every node.  The even block computes the forward oracle and owns the FW
+// state; the odd block computes the in-face oracle at the same time.  Grid
+// barriers are safe here because the launcher admits the kernel only when its
+// complete grid is resident.
+template<typename DeviceObjective, typename Algorithm, typename LMO>
+__global__ void drs_dicg_paired_batch_kernel(
+    DeviceObjective obj, Algorithm alg, LMO lmo,
+    double* x, const double* lb, const double* ub,
+    double* out_gap, int* out_iterations, uint8_t* converged,
+    double* best_vertex, double* best_vertex_val, double* workspace,
+    unsigned char* objective_workspace, size_t objective_workspace_stride,
+    int N, int max_iters, const double* eps_by_node, int* all_done)
+{
+    static_assert(DRSUsesDICG<Algorithm>::value,
+                  "paired oracle kernel is DICG-only");
+    constexpr int n = DeviceObjective::n_vars;
+    cg::grid_group grid = cg::this_grid();
+    const int node = (int)blockIdx.x >> 1;
+    const bool forward = ((int)blockIdx.x & 1) == 0;
+    const int tid = threadIdx.x;
+    const int nw = blockDim.x >> 5;
+    if (node >= N) return;
+
+    // Four vectors per node: the ordinary kernel uses the first three.  The
+    // fourth holds -grad so the in-face LMO never aliases the forward block's
+    // gradient while both oracles execute.
+    constexpr int paired_vectors =
+        4 + (Algorithm::uses_secant_line_search ? 2 : 0);
+    double* base = workspace + (size_t)node * paired_vectors * n;
+    double* grad = base;
+    double* v = grad + n;
+    double* away = v + n;
+    double* neg_grad = away + n;
+    double* trial_x = nullptr;
+    double* trial_grad = nullptr;
+    if constexpr (Algorithm::uses_secant_line_search) {
+        trial_x = neg_grad + n;
+        trial_grad = trial_x + n;
+    }
+    double* xn = x + (size_t)node * n;
+    const double* lbn = lb + (size_t)node * n;
+    const double* ubn = ub + (size_t)node * n;
+    double* best = best_vertex + (size_t)node * n;
+    extern __shared__ __align__(16) unsigned char smem_raw[];
+    double* ws = reinterpret_cast<double*>(smem_raw);
+    unsigned char* obj_mem = objective_workspace
+        + (size_t)node * objective_workspace_stride;
+    obj_mem = reinterpret_cast<unsigned char*>(
+        (reinterpret_cast<uintptr_t>(obj_mem) + 15u) & ~uintptr_t(15u));
+
+    __shared__ double gap_s, gamma_s, candidate_s;
+    __shared__ double phi_lo_s, phi_hi_s, lo_s, hi_s;
+    __shared__ double f_base_s, best_f_s, best_gamma_s;
+    __shared__ bool done_s, line_done_s, candidate_better_s;
+    if (forward) {
+        if (tid == 0) {
+            converged[node] = 0;
+            out_iterations[node] = 0;
+            best_vertex_val[node] = 1e300;
+        }
+        obj.prepare_block(tid, obj_mem);
+        __syncthreads();
+        for (int j = tid; j < n; j += blockDim.x)
+            grad[j] = -1.0 - static_cast<double>(j) / (n + 1.0);
+        __syncthreads();
+        lmo.compute_v(tid, n, grad, lbn, ubn, v);
+        __syncthreads();
+        for (int j = tid; j < n; j += blockDim.x) xn[j] = v[j];
+    }
+    grid.sync();
+
+    for (int iter = 0; iter < max_iters; ++iter) {
+        if (forward && converged[node] == 0) {
+            if (tid == 0) out_iterations[node] = iter + 1;
+            obj.grad(tid, xn, grad, obj_mem);
+        }
+        grid.sync();
+
+        if (forward && converged[node] == 0) {
+            lmo.compute_v(tid, n, grad, lbn, ubn, v);
+        } else if (!forward && converged[node] == 0) {
+            for (int j = tid; j < n; j += blockDim.x)
+                neg_grad[j] = -grad[j];
+            __syncthreads();
+            lmo.compute_inface_v(tid, n, neg_grad, xn, lbn, ubn, away);
+        }
+        grid.sync();
+
+        if (forward && converged[node] == 0) {
+            const double fv = drs_block_reduce(
+                obj.value_local(tid, v, obj_mem), tid, nw, ws);
+            if (tid == 0) {
+                candidate_s = fv;
+                candidate_better_s = fv < best_vertex_val[node];
+            }
+            __syncthreads();
+            if (candidate_better_s) {
+                for (int j = tid; j < n; j += blockDim.x) best[j] = v[j];
+                if (tid == 0) best_vertex_val[node] = candidate_s;
+            }
+            __syncthreads();
+            double local_gap = 0.0;
+            for (int j = tid; j < n; j += blockDim.x)
+                local_gap += grad[j] * (xn[j] - v[j]);
+            const double gap = drs_block_reduce(local_gap, tid, nw, ws);
+            if (tid == 0) {
+                gap_s = gap;
+                done_s = alg.check_converged(gap, eps_by_node[node]);
+                out_gap[node] = gap;
+                converged[node] = done_s ? 1 : 0;
+            }
+            __syncthreads();
+            if (!done_s) {
+                const double af = drs_block_reduce(
+                    obj.value_local(tid, away, obj_mem), tid, nw, ws);
+                if (tid == 0) {
+                    candidate_s = af;
+                    candidate_better_s = af < best_vertex_val[node];
+                }
+                __syncthreads();
+                if (candidate_better_s) {
+                    for (int j = tid; j < n; j += blockDim.x)
+                        best[j] = away[j];
+                    if (tid == 0) best_vertex_val[node] = candidate_s;
+                }
+                __syncthreads();
+                for (int j = tid; j < n; j += blockDim.x)
+                    away[j] -= v[j];
+                __syncthreads();
+                const double coordinate = drs_block_min(
+                    lmo.dicg_maximum_step_local(
+                        tid, n, away, xn, lbn, ubn), tid, nw, ws);
+                const double aggregate =
+                    lmo.dicg_sum_maximum_step(tid, n, away, xn);
+                if (tid == 0)
+                    gamma_s = fmax(0.0, fmin(coordinate, aggregate));
+                __syncthreads();
+                if constexpr (Algorithm::uses_secant_line_search) {
+                    for (int j = tid; j < n; j += blockDim.x)
+                        away[j] = -away[j];
+                    __syncthreads();
+                    double local_pairwise_gap = 0.0;
+                    for (int j = tid; j < n; j += blockDim.x)
+                        local_pairwise_gap -= grad[j] * away[j];
+                    const double pairwise_gap = drs_block_reduce(
+                        local_pairwise_gap, tid, nw, ws);
+                    const double gamma = alg.ls.search(
+                        obj, tid, n, nw, pairwise_gap, gamma_s, xn, away,
+                        trial_x, trial_grad, ws, obj_mem,
+                        &gamma_s, &phi_lo_s, &phi_hi_s, &lo_s, &hi_s,
+                        &f_base_s, &best_f_s, &best_gamma_s, &line_done_s);
+                    for (int j = tid; j < n; j += blockDim.x)
+                        xn[j] += gamma * away[j];
+                } else {
+                    if (tid == 0) {
+                        const double maximum = gamma_s;
+                        const double scheduled = alg.step_size(iter, gap_s);
+                        if constexpr (DRSSafeguardsDICGDropStep<Algorithm>::value)
+                            gamma_s = maximum <= scheduled
+                                ? maximum : maximum * scheduled;
+                        else if constexpr (DRSScalesDICGMaximumStep<Algorithm>::value)
+                            gamma_s = maximum * scheduled;
+                        else
+                            gamma_s = fmin(maximum, scheduled);
+                    }
+                    __syncthreads();
+                    for (int j = tid; j < n; j += blockDim.x)
+                        alg.update(xn, away, gamma_s, j);
+                }
+            }
+        }
+        grid.sync();
+
+        if (blockIdx.x == 0 && tid == 0) {
+            int done = 1;
+            for (int i = 0; i < N; ++i) done &= converged[i] != 0;
+            *all_done = done;
+        }
+        grid.sync();
+        if (*all_done) break;
+    }
+
+    if (!forward) return;
+    // Return a certificate coherent with the final iterate, matching the
+    // ordinary kernel's post-loop behavior.
+    obj.grad(tid, xn, grad, obj_mem);
+    __syncthreads();
+    lmo.compute_v(tid, n, grad, lbn, ubn, v);
+    __syncthreads();
+    const double final_fv = drs_block_reduce(
+        obj.value_local(tid, v, obj_mem), tid, nw, ws);
+    if (tid == 0) {
+        candidate_s = final_fv;
+        candidate_better_s = final_fv < best_vertex_val[node];
+    }
+    __syncthreads();
+    if (candidate_better_s) {
+        for (int j = tid; j < n; j += blockDim.x) best[j] = v[j];
+        if (tid == 0) best_vertex_val[node] = candidate_s;
+    }
+    __syncthreads();
+    double local_gap = 0.0;
+    for (int j = tid; j < n; j += blockDim.x)
+        local_gap += grad[j] * (xn[j] - v[j]);
+    const double final_gap = drs_block_reduce(local_gap, tid, nw, ws);
+    if (tid == 0) {
+        out_gap[node] = final_gap;
+        converged[node] = alg.check_converged(
+            final_gap, eps_by_node[node]) ? 1 : 0;
+    }
+}
+
 struct DeviceResidentConfig {
+    enum class DICGOracleParallelism { Auto, Serial, Paired };
     int    gpu_batch_size = 1024;
     int    num_streams    = 8;
     // 0 selects a warp-aligned size automatically. A positive override must
@@ -442,6 +659,10 @@ struct DeviceResidentConfig {
     double integer_tol    = 1e-6;
     double abs_gap_tol    = 1e-6;
     double rel_gap_tol    = 1e-2;
+    DICGOracleParallelism dicg_oracle_parallelism =
+        DICGOracleParallelism::Auto;
+    // Fraction of the cooperative-grid residency limit usable by Auto.
+    double dicg_paired_occupancy_fraction = 0.8;
 };
 
 enum class DRSSchedulingEventType {
@@ -476,6 +697,7 @@ struct DRSStreamSlot {
     int          capacity = 0;
     int          n_nodes  = 0;
     bool         in_use   = false;
+    bool         paired_dicg = false;
     std::uint64_t generation = 0;
 
     DRSCompletionSignal sig{};
@@ -503,6 +725,7 @@ struct DRSStreamSlot {
     double*  d_workspace = nullptr;
     unsigned char* d_objective_workspace = nullptr;
     uint8_t* d_cnv = nullptr;
+    int*     d_all_done = nullptr;
 
     void alloc(int cap, int n, int work_vectors, size_t objective_stride) {
         capacity = cap;
@@ -527,6 +750,7 @@ struct DRSStreamSlot {
         DRS_CUDA_CHECK(cudaMalloc(&d_best_vertex,     xn  * sizeof(double)));
         DRS_CUDA_CHECK(cudaMalloc(&d_best_vertex_val, cap * sizeof(double)));
         DRS_CUDA_CHECK(cudaMalloc(&d_cnv, cap * sizeof(uint8_t)));
+        DRS_CUDA_CHECK(cudaMalloc(&d_all_done, sizeof(int)));
         DRS_CUDA_CHECK(cudaMalloc(
             &d_workspace, xn * (size_t)work_vectors * sizeof(double)));
         DRS_CUDA_CHECK(cudaMalloc(
@@ -555,6 +779,7 @@ struct DRSStreamSlot {
         cudaFree(d_best_vertex);
         cudaFree(d_best_vertex_val);
         cudaFree(d_cnv);
+        cudaFree(d_all_done);
         cudaFree(d_workspace);
         cudaFree(d_objective_workspace);
         if (stream) cudaStreamDestroy(stream);
@@ -598,7 +823,10 @@ public:
                 || !std::isfinite(cfg_.gpu_eps_decay)
                 || cfg_.gpu_eps_decay <= 0.0 || cfg_.gpu_eps_decay > 1.0
                 || !std::isfinite(cfg_.abs_gap_tol) || cfg_.abs_gap_tol < 0.0
-                || !std::isfinite(cfg_.rel_gap_tol) || cfg_.rel_gap_tol < 0.0)
+                || !std::isfinite(cfg_.rel_gap_tol) || cfg_.rel_gap_tol < 0.0
+                || !std::isfinite(cfg_.dicg_paired_occupancy_fraction)
+                || cfg_.dicg_paired_occupancy_fraction <= 0.0
+                || cfg_.dicg_paired_occupancy_fraction > 1.0)
             throw std::invalid_argument("invalid tolerance configuration");
         if (std::isnan(time_limit_seconds_) || time_limit_seconds_ <= 0.0)
             throw std::invalid_argument("time limit must be positive");
@@ -658,6 +886,9 @@ public:
     bool                last_gpu_converged() const { return last_gpu_converged_.load(); }
     bool                reached_tolerance() const { return reached_tolerance_; }
     bool                reached_time_limit() const { return reached_time_limit_; }
+    int                 paired_gpu_batches() const {
+        return paired_gpu_batches_.load(std::memory_order_relaxed);
+    }
 
 private:
     const Problem&       prob_;
@@ -677,6 +908,7 @@ private:
     std::atomic<double> last_gpu_gap_{std::numeric_limits<double>::infinity()};
     std::atomic<bool> last_gpu_converged_{false};
     std::atomic<bool> done_{false};
+    std::atomic<int> paired_gpu_batches_{0};
     double final_dual_bound_ = -std::numeric_limits<double>::infinity();
     bool reached_tolerance_ = false;
     bool reached_time_limit_ = false;
@@ -685,6 +917,7 @@ private:
     double time_limit_seconds_ = std::numeric_limits<double>::infinity();
     std::function<void(int, int, double, double, bool)> progress_cb_;
     std::function<void(const DRSSchedulingEvent&)> scheduling_cb_;
+    mutable bool paired_kernel_resource_compatible_ = true;
 
     std::vector<DRSStreamSlot> slots_;
     std::mutex                 completed_mtx_;
@@ -693,7 +926,7 @@ private:
 
     static constexpr int kernel_work_vectors() {
         return
-            2 + (DRSUsesDICG<Algorithm>::value ? 1 : 0)
+            2 + (DRSUsesDICG<Algorithm>::value ? 2 : 0)
               + (Algorithm::uses_secant_line_search ? 2 : 0);
     }
 
@@ -731,6 +964,46 @@ private:
         return std::min(std::max(32, wanted), warp_limit);
     }
 
+    bool paired_dicg_available(int N, int n) const {
+        if constexpr (!DRSUsesDICG<Algorithm>::value) {
+            return false;
+        } else {
+            if (!paired_kernel_resource_compatible_) return false;
+            int device = 0;
+            cudaDeviceProp prop{};
+            DRS_CUDA_CHECK(cudaGetDevice(&device));
+            DRS_CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+            if (!prop.cooperativeLaunch) return false;
+            const int threads = kernel_block_threads(n);
+            int blocks_per_sm = 0;
+            DRS_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &blocks_per_sm,
+                drs_dicg_paired_batch_kernel<DeviceObjective, Algorithm, LMO>,
+                threads, kernel_dynamic_shared_bytes()));
+            const int resident = blocks_per_sm * prop.multiProcessorCount;
+            const bool forced = cfg_.dicg_oracle_parallelism ==
+                DeviceResidentConfig::DICGOracleParallelism::Paired;
+            const int allowed = (int)std::floor(
+                (forced ? 1.0 : cfg_.dicg_paired_occupancy_fraction)
+                * resident);
+            return 2 * N <= allowed;
+        }
+    }
+
+    bool choose_paired_dicg(int N, int n) const {
+        using Mode = DeviceResidentConfig::DICGOracleParallelism;
+        if (cfg_.dicg_oracle_parallelism == Mode::Serial) return false;
+        bool other_active = false;
+        for (const auto& active : slots_)
+            if (active.in_use) { other_active = true; break; }
+        const bool available = !other_active && paired_dicg_available(N, n);
+        if (cfg_.dicg_oracle_parallelism == Mode::Paired && !available)
+            throw std::runtime_error(
+                "forced paired DICG requires an idle cooperative-capable GPU "
+                "and a fully resident 2*N-block grid");
+        return available;
+    }
+
     void configure_kernel_shared_memory() const {
         constexpr int dynamic_bytes = kernel_dynamic_shared_bytes();
 
@@ -764,6 +1037,24 @@ private:
                 drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 dynamic_bytes));
+        }
+        if constexpr (DRSUsesDICG<Algorithm>::value) {
+            cudaFuncAttributes paired_attrs{};
+            DRS_CUDA_CHECK(cudaFuncGetAttributes(
+                &paired_attrs,
+                drs_dicg_paired_batch_kernel<
+                    DeviceObjective, Algorithm, LMO>));
+            const size_t paired_total =
+                (size_t)paired_attrs.sharedSizeBytes + (size_t)dynamic_bytes;
+            if (paired_total > (size_t)optin_limit) {
+                paired_kernel_resource_compatible_ = false;
+            } else if (paired_total > (size_t)default_limit) {
+                DRS_CUDA_CHECK(cudaFuncSetAttribute(
+                    drs_dicg_paired_batch_kernel<
+                        DeviceObjective, Algorithm, LMO>,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    dynamic_bytes));
+            }
         }
     }
 
@@ -905,6 +1196,11 @@ private:
     }
 
     void fill_free_slots(bool allow_partial = false) {
+        // A paired cooperative grid owns the device until completion.  Do not
+        // enqueue an ordinary kernel from another stream while its blocks are
+        // using grid-wide barriers.
+        for (const auto& active : slots_)
+            if (active.in_use && active.paired_dicg) return;
         for (auto& slot : slots_) {
             if (slot.in_use) continue;
             // Normally launch only full batches. The caller may allow one
@@ -918,6 +1214,7 @@ private:
             active_bounds_.insert(batch);
             active_tasks_.fetch_add((int)batch.size(), std::memory_order_relaxed);
             submit_slot(slot, std::move(batch));
+            if (slot.paired_dicg) break;
             // At most one under-filled batch should be launched. Once it has
             // consumed the frontier there cannot be useful work for another
             // free slot in this pass.
@@ -958,6 +1255,9 @@ private:
     void submit_slot(DRSStreamSlot& slot, std::vector<Node> batch) {
         const int n = prob_.n_vars;
         const int N = (int)batch.size();
+        slot.paired_dicg = choose_paired_dicg(N, n);
+        if (slot.paired_dicg)
+            paired_gpu_batches_.fetch_add(1, std::memory_order_relaxed);
         slot.batch_nodes = std::move(batch);
         slot.n_nodes = N;
         slot.in_use = true;
@@ -1004,15 +1304,46 @@ private:
         const int block_threads = kernel_block_threads(n);
         constexpr int smem = kernel_dynamic_shared_bytes();
 
-        drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>
-            <<<N, block_threads, smem, slot.stream>>>(
-                obj_, alg_, lmo_,
-                slot.d_x, slot.d_lb, slot.d_ub, slot.d_gap,
-                slot.d_iterations, slot.d_cnv,
-                slot.d_best_vertex, slot.d_best_vertex_val,
-                slot.d_workspace, slot.d_objective_workspace,
-                objective_workspace_stride(),
-                N, cfg_.gpu_max_iters, slot.d_eps);
+        if constexpr (DRSUsesDICG<Algorithm>::value) {
+            if (slot.paired_dicg) {
+                DRS_CUDA_CHECK(cudaMemsetAsync(
+                    slot.d_all_done, 0, sizeof(int), slot.stream));
+                size_t objective_stride = objective_workspace_stride();
+                int max_iters = cfg_.gpu_max_iters;
+                int launch_N = N;
+                void* args[] = {
+                    &obj_, &alg_, &lmo_, &slot.d_x, &slot.d_lb, &slot.d_ub,
+                    &slot.d_gap, &slot.d_iterations, &slot.d_cnv,
+                    &slot.d_best_vertex, &slot.d_best_vertex_val,
+                    &slot.d_workspace, &slot.d_objective_workspace,
+                    &objective_stride, &launch_N, &max_iters, &slot.d_eps,
+                    &slot.d_all_done
+                };
+                DRS_CUDA_CHECK(cudaLaunchCooperativeKernel(
+                    (void*)drs_dicg_paired_batch_kernel<
+                        DeviceObjective, Algorithm, LMO>,
+                    dim3(2 * N), dim3(block_threads), args, smem,
+                    slot.stream));
+            } else {
+                drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>
+                    <<<N, block_threads, smem, slot.stream>>>(
+                        obj_, alg_, lmo_, slot.d_x, slot.d_lb, slot.d_ub,
+                        slot.d_gap, slot.d_iterations, slot.d_cnv,
+                        slot.d_best_vertex, slot.d_best_vertex_val,
+                        slot.d_workspace, slot.d_objective_workspace,
+                        objective_workspace_stride(), N, cfg_.gpu_max_iters,
+                        slot.d_eps);
+            }
+        } else {
+            drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>
+                <<<N, block_threads, smem, slot.stream>>>(
+                    obj_, alg_, lmo_, slot.d_x, slot.d_lb, slot.d_ub,
+                    slot.d_gap, slot.d_iterations, slot.d_cnv,
+                    slot.d_best_vertex, slot.d_best_vertex_val,
+                    slot.d_workspace, slot.d_objective_workspace,
+                    objective_workspace_stride(), N, cfg_.gpu_max_iters,
+                    slot.d_eps);
+        }
         DRS_CUDA_CHECK(cudaGetLastError());
 
         DRS_CUDA_CHECK(cudaMemcpyAsync(slot.h_x,   slot.d_x,   xn * sizeof(double),  cudaMemcpyDeviceToHost, slot.stream));
