@@ -32,11 +32,11 @@ inline double gap_relative(double bound, double incumbent) {
     //
     //                 U - L
     //       gaprel = ----------- .
-    //                max(|L|,|U|)
+    //                min(|L|,|U|)
     //
     // If L == U == 0, the absolute gap is zero and the relative gap is
     // defined as zero rather than the indeterminate value 0/0.
-    const double scale = std::max(std::abs(bound), std::abs(incumbent));
+    const double scale = std::min(std::abs(bound), std::abs(incumbent));
     if (scale == 0.0) return 0.0;
     return (incumbent - bound) / scale;
 }
