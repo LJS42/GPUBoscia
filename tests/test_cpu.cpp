@@ -10,16 +10,19 @@
 #include <vector>
 #include <numeric>
 
-#include "bnb.h"
-#include "lmo_dicg.h"
-#include "node.h"
-#include "node_select.h"
-#include "branching.h"
-#include "heuristics.h"
-#include "gap_utils.h"
-#include "problem.h"
-#include "cpu_relax.h"
-#include "tree.h"
+#include <gpuboscia/line_search_options.h>
+#include "../examples/common/options.h"
+#include <gpuboscia/bnb.h>
+#include <gpuboscia/lmo_dicg.h>
+#include <gpuboscia/node.h>
+#include <gpuboscia/node_select.h>
+#include <gpuboscia/branching.h>
+#include <gpuboscia/heuristics.h>
+#include <gpuboscia/gap_utils.h>
+#include <gpuboscia/problem.h>
+#include <gpuboscia/cpu_relax.h>
+#include <gpuboscia/tree.h>
+#include <gpuboscia/concurrent_queue.h>
 
 // ============================================================
 //  Minimal test harness
@@ -40,14 +43,14 @@ static int g_fail = 0;
 void test_certified_fw_lower_bound() {
     std::cout << "\n[certified_fw_lower_bound]\n";
     const double inherited = -7.0;
-    EXPECT_NEAR(fastbb::certified_fw_lower_bound(inherited, 10.0, 3.0),
+    EXPECT_NEAR(gpuboscia::certified_fw_lower_bound(inherited, 10.0, 3.0),
                 7.0, 1e-12, "valid certificate advances lower bound");
-    EXPECT_NEAR(fastbb::certified_fw_lower_bound(inherited, 10.0, -1e-12),
+    EXPECT_NEAR(gpuboscia::certified_fw_lower_bound(inherited, 10.0, -1e-12),
                 inherited, 1e-12, "negative gap preserves inherited bound");
-    EXPECT_NEAR(fastbb::certified_fw_lower_bound(
+    EXPECT_NEAR(gpuboscia::certified_fw_lower_bound(
                     inherited, 10.0, std::numeric_limits<double>::quiet_NaN()),
                 inherited, 1e-12, "NaN gap preserves inherited bound");
-    EXPECT_NEAR(fastbb::certified_fw_lower_bound(
+    EXPECT_NEAR(gpuboscia::certified_fw_lower_bound(
                     inherited, std::numeric_limits<double>::infinity(), 1.0),
                 inherited, 1e-12, "non-finite primal preserves inherited bound");
 }
@@ -148,29 +151,29 @@ void test_rounding_heuristics() {
 void test_gap_tolerance() {
     std::cout << "\n[gap helpers]\n";
 
-    EXPECT_NEAR(fastbb::gap_absolute(9.0, 10.0), 1.0, 1e-12,
+    EXPECT_NEAR(gpuboscia::gap_absolute(9.0, 10.0), 1.0, 1e-12,
                 "absolute gap matches logger value");
-    EXPECT_NEAR(fastbb::gap_relative(9.0, 10.0), 0.1, 1e-12,
+    EXPECT_NEAR(gpuboscia::gap_relative(9.0, 10.0), 0.1, 1e-12,
                 "relative gap uses max(|bound|, |incumbent|)");
-    EXPECT_NEAR(fastbb::gap_relative(0.25, 0.75), 2.0 / 3.0, 1e-12,
+    EXPECT_NEAR(gpuboscia::gap_relative(0.25, 0.75), 2.0 / 3.0, 1e-12,
                 "relative gap does not floor the denominator at one");
-    EXPECT_NEAR(fastbb::gap_relative(-10.0, -9.0), 0.1, 1e-12,
+    EXPECT_NEAR(gpuboscia::gap_relative(-10.0, -9.0), 0.1, 1e-12,
                 "relative gap denominator is symmetric in both bounds");
-    EXPECT_NEAR(fastbb::gap_relative(0.0, 0.0), 0.0, 1e-12,
+    EXPECT_NEAR(gpuboscia::gap_relative(0.0, 0.0), 0.0, 1e-12,
                 "zero-over-zero relative gap is zero at a closed gap");
 
-    EXPECT(fastbb::gap_within_tolerance(9.99, 10.0, 0.02, 1e-12),
+    EXPECT(gpuboscia::gap_within_tolerance(9.99, 10.0, 0.02, 1e-12),
            "within absolute tolerance");
-    EXPECT(fastbb::gap_within_tolerance(99.0, 100.0, 1e-12, 0.011),
+    EXPECT(gpuboscia::gap_within_tolerance(99.0, 100.0, 1e-12, 0.011),
            "within relative tolerance");
-    EXPECT(!fastbb::gap_within_tolerance(-1.0, 1.0, 0.1, 0.1),
+    EXPECT(!gpuboscia::gap_within_tolerance(-1.0, 1.0, 0.1, 0.1),
            "opposite signs do not satisfy relative tolerance");
 
-    EXPECT_NEAR(fastbb::depth_dependent_tolerance(1e-3, 0.8, 1e-6, 0),
+    EXPECT_NEAR(gpuboscia::depth_dependent_tolerance(1e-3, 0.8, 1e-6, 0),
                 1e-3, 1e-15, "root uses configured tolerance");
-    EXPECT_NEAR(fastbb::depth_dependent_tolerance(1e-3, 0.8, 1e-6, 2),
+    EXPECT_NEAR(gpuboscia::depth_dependent_tolerance(1e-3, 0.8, 1e-6, 2),
                 6.4e-4, 1e-15, "child tolerance decays with depth");
-    EXPECT_NEAR(fastbb::depth_dependent_tolerance(1e-3, 0.8, 1e-6, 1000),
+    EXPECT_NEAR(gpuboscia::depth_dependent_tolerance(1e-3, 0.8, 1e-6, 1000),
                 1e-6, 1e-15, "child tolerance stops at configured minimum");
 }
 
@@ -551,10 +554,62 @@ void test_equality_simplex_lmo_primitives() {
 // ============================================================
 //  main
 // ============================================================
+void test_queue_deferred_pruning() {
+    ConcurrentQueue queue;
+    for (int i = 0; i < 4; ++i) {
+        Node nd(i, i < 2 ? 10 : 20, 1, {0.0}, {1.0});
+        nd.dual_bound = i;
+        queue.push(nd);
+    }
+    EXPECT(queue.pop_full_batch(3, 1.5).empty(),
+           "full batch does not submit nodes already cut off");
+    EXPECT(queue.size() == 2, "live nodes retained when full batch unavailable");
+    Node other(4, 20, 1, {0.0}, {1.0});
+    other.dual_bound = 0.5;
+    queue.push(other);
+    queue.discard_children(10);
+    auto batch = queue.pop_batch(3, 1.5);
+    EXPECT(batch.size() == 1 && batch[0].id == 4,
+           "deferred parent pruning removes only its queued children");
+}
+
+void test_raw_oracle_incumbent() {
+    EXPECT(!is_exact_integer_candidate({0.75, 0.75}, {0, 1}),
+           "fractional box oracle vertex cannot become integer incumbent");
+    EXPECT(!is_exact_integer_candidate({1.0 - 1e-8, 1.0}, {0, 1}),
+           "near-integer raw vertex must be rounded before acceptance");
+    EXPECT(is_exact_integer_candidate({1.0, 1.0}, {0, 1}),
+           "integer oracle vertex remains eligible for incumbent");
+    EXPECT(is_exact_integer_candidate({1.0, 0.75}, {0}),
+           "continuous coordinates may remain fractional");
+    EXPECT(!is_exact_integer_candidate({NAN, 1.0}, {0, 1}),
+           "nonfinite oracle vertex cannot become incumbent");
+}
+
+static void test_quadratic_exact_step() {
+    EXPECT_NEAR(quadratic_exact_step(3, 6, 1), 0.5, 1e-14, "quadratic interior minimum");
+    EXPECT_EQ(quadratic_exact_step(3, 2, 0.25), 0.25, "quadratic step obeys feasible upper bound");
+    EXPECT_EQ(quadratic_exact_step(-3, 6, 1), 0, "quadratic uphill direction stays put");
+    EXPECT_EQ(quadratic_exact_step(3, 0, 1), 1, "linear descent takes endpoint");
+    EXPECT_EQ(quadratic_exact_step(0, 0, 1), 0, "flat direction stays put");
+    EXPECT_EQ(quadratic_exact_step(-1, -4, 1), 1, "concave restriction compares endpoints");
+    EXPECT_EQ(quadratic_exact_step(3, 6, 0), 0, "zero feasible step");
+    EXPECT_NEAR(quadratic_exact_step(3e-100, 6e-100, 1), 0.5, 1e-14,
+                "small positive curvature is not discarded");
+    char prog[] = "test", flag[] = "--line-search", value[] = "quadratic-exact";
+    char* argv[] = {prog, flag, value};
+    GPUBosciaExampleOptions opts;
+    EXPECT_EQ(parse_gpuboscia_example_options(3, argv, opts), -1, "exact CLI option accepted");
+    EXPECT(opts.line_search.kind == LineSearchKind::QuadraticExact, "exact CLI policy selected");
+}
+
 int main() {
-    std::cout << "=== FastBB CPU Unit Tests ===\n";
+    test_quadratic_exact_step();
+    std::cout << "=== GPUBoscia CPU Unit Tests ===\n";
 
     test_is_integer_feasible();
+    test_queue_deferred_pruning();
+    test_raw_oracle_incumbent();
     test_is_node_feasible();
     test_rounding_heuristics();
     test_gap_tolerance();

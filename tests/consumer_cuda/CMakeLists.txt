@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(GPUBosciaCUDAConsumer LANGUAGES CXX CUDA)
+find_package(GPUBoscia 0.1 CONFIG REQUIRED)
+add_executable(consumer "${GPUBOSCIA_EXAMPLE_SOURCE}" second.cu)
+target_link_libraries(consumer PRIVATE gpuboscia::gpuboscia)
+set_target_properties(consumer PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+enable_testing()
+add_test(NAME consumer_solves COMMAND consumer)
