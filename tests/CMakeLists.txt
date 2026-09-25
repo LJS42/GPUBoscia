@@ -17,12 +17,13 @@ target_link_libraries(test_header_includes PRIVATE gpuboscia::core)
 
 if(GPUBOSCIA_ENABLE_CUDA)
     add_executable(test_pipeline test_pipeline.cu)
-    target_link_libraries(test_pipeline PRIVATE gpuboscia::gpuboscia CUDA::cublas)
+    target_link_libraries(test_pipeline PRIVATE gpuboscia::gpuboscia)
     set_target_properties(test_pipeline PROPERTIES
         CUDA_ARCHITECTURES "${GPUBOSCIA_CUDA_ARCH}"
         CUDA_SEPARABLE_COMPILATION ON
         RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
     add_test(NAME pipeline_tests COMMAND test_pipeline)
+    set_tests_properties(pipeline_tests PROPERTIES SKIP_RETURN_CODE 77)
     if(TARGET gpuboscia_minimal)
         add_test(NAME minimal_example COMMAND gpuboscia_minimal)
     endif()

@@ -23,11 +23,3 @@ target_link_libraries(sparse_sharpe PRIVATE ZLIB::ZLIB)
 target_compile_definitions(sparse_sharpe PRIVATE GPUBOSCIA_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 
 gpuboscia_add_example(weighted_clique weighted_clique.cu)
-gpuboscia_add_example(quantization_sparse quantization_sparse.cu)
-set(GPUBOSCIA_QUANTIZATION_WEIGHTS "4096" CACHE STRING "Weights per quantization row")
-if(NOT GPUBOSCIA_QUANTIZATION_WEIGHTS MATCHES "^[1-9][0-9]*$")
-    message(FATAL_ERROR "GPUBOSCIA_QUANTIZATION_WEIGHTS must be a positive integer")
-endif()
-target_compile_definitions(quantization_sparse PRIVATE
-    GPUBOSCIA_QUANTIZATION_WEIGHTS=${GPUBOSCIA_QUANTIZATION_WEIGHTS})
-target_link_libraries(quantization_sparse PRIVATE CUDA::cublas)

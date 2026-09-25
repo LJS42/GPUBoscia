@@ -17,8 +17,7 @@ Requirements:
 - CMake 3.20 or newer.
 - A CUDA Toolkit and host compiler supporting C++17.
 - An NVIDIA GPU to run the solver.
-- ZLIB when building all examples. The quantization example also uses cuBLAS,
-  supplied with the CUDA Toolkit.
+- ZLIB when building all examples.
 
 Replace `80` with the CUDA architecture of your GPU:
 
@@ -114,7 +113,6 @@ the solver does not remove that constraint.
 | `GPUBOSCIA_BUILD_TESTS` | `ON` | Build tests |
 | `GPUBOSCIA_INSTALL` | `ON` | Generate installation and package export rules |
 | `GPUBOSCIA_CUDA_ARCH` | Existing `CMAKE_CUDA_ARCHITECTURES`, otherwise `80` | GPU architectures for this project's examples and tests |
-| `GPUBOSCIA_QUANTIZATION_WEIGHTS` | `4096` | Weights per row in the quantization example; use `576` for ResNet20 |
 
 The `gpuboscia::core` target provides CPU utilities and the Threads dependency.
 To build and test without CUDA:
@@ -139,7 +137,7 @@ include/gpuboscia/    Solver headers and general utilities
 cmake/               Installed CMake package configuration
 examples/            Standalone optimization programs
 examples/common/     Example-specific command-line parsing
-experiments/         ResNet20 data export, solving, and evaluation scripts
+standalone/          Portable external projects, excluded from the library build/install
 tests/               Algorithm, header inclusion, and package consumption tests
 DataSets/            Existing experimental datasets
 test_instances/      Existing optimization instances
@@ -147,15 +145,24 @@ test_instances/      Existing optimization instances
 
 The command-line application is built with target `gpuboscia_cli` and runs as
 `./build/gpuboscia`. Other example targets include `gpuboscia_minimal`,
-`sparse_sharpe`, `weighted_clique`, and `quantization_sparse`:
+`sparse_sharpe` and `weighted_clique`.
 
-```bash
-cmake --build build --target quantization_sparse
-./build/quantization_sparse --help
-```
+## Separate quantization experiment repository
 
-The quantization implementation is currently an example, rather than a separate
-library. See [experiments/README.md](experiments/README.md) for the ResNet20 workflow.
+The quantization implementation and ResNet20 scripts have moved to
+[standalone/quantization_sparse](standalone/quantization_sparse/README.md).
+That directory is a complete external CMake project: copy it into a new
+repository, install GPUBoscia, and configure the experiment with
+`-DCMAKE_PREFIX_PATH=/path/to/gpuboscia/install`.
+
+The experiment uses `find_package(GPUBoscia 0.1 CONFIG REQUIRED)` and links
+`gpuboscia::gpuboscia`. It has no relative includes into this repository and does
+not vendor the solver headers. Neither the library build nor its tests depend
+on that directory. The installed GPUBoscia package does not contain experiments.
+
+Quantization-specific tests and the optional root diagnostic belong to the
+experiment project. The core GPU suite runs the general solver regressions,
+including exact line-search checks, independently of the experiment.
 
 ## Tests and validation
 
