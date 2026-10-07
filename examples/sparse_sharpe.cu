@@ -229,30 +229,7 @@ struct SparseSharpeObjective {
     static constexpr int shared_bytes = 16;
     const double* d_H;
     const double* d_mu;
-    const double* h_H;
-    const double* h_mu;
     int assets;
-
-    double f(const std::vector<double>& x) const {
-        double value = 0.0;
-        for (int i = 0; i < assets; ++i) {
-            value -= h_mu[i] * x[i];
-            for (int j = 0; j < assets; ++j)
-                value += 0.5 * x[i] * h_H[i * assets + j] * x[j];
-        }
-        return value;
-    }
-
-    void gradient_host(const std::vector<double>& x,
-                       std::vector<double>& g) const {
-        std::fill(g.begin(), g.end(), 0.0);
-        for (int i = 0; i < assets; ++i) {
-            double value = -h_mu[i];
-            for (int j = 0; j < assets; ++j)
-                value += h_H[i * assets + j] * x[j];
-            g[i] = value;
-        }
-    }
 
     __device__ void prepare_block(int, unsigned char*) const {}
 
@@ -294,151 +271,86 @@ struct LinkedCardinalityLMO {
     int assets;
     int cardinality;
     const double* device_upper_bounds;
-    const double* host_upper_bounds;
-    const double* host_H;
-    const double* host_mu;
+    const double* device_H;
+    const double* device_mu;
 
-    bool check_feasible(const Node& node,
-                        const std::vector<int>&) const {
+    __device__ bool check_feasible_device(int tid, int, const double* lb,
+        const double*, const uint8_t*, double*, double*) const {
         int mandatory = 0;
-        for (int i = 0; i < assets; ++i) {
-            mandatory += node.lb[MaxAssets + i] > 0.5;
-        }
-        return mandatory <= cardinality;
+        for (int i = tid; i < assets; i += blockDim.x)
+            mandatory += lb[MaxAssets + i] > 0.5;
+        return feasibility_block_sum(mandatory) <= cardinality;
     }
 
-    // Recover a feasible sparse point from a fractional relaxation.  Keep all
-    // mandatory selections, fill the remaining support with the largest v_i,
-    // then minimize 0.5*(t*d)'H(t*d)-mu'(t*d) analytically over t>=0.
-    std::vector<double> integer_candidate(
-        const std::vector<double>& x,
-        const std::vector<double>& lb,
-        const std::vector<double>& ub) const {
-        std::vector<double> candidate(Variables, 0.0);
-        std::vector<int> support;
-        std::vector<unsigned char> selected(assets, 0);
-        for (int i = 0; i < assets; ++i)
-            if (lb[MaxAssets + i] > 0.5) {
-                selected[i] = 1;
-                support.push_back(i);
+    // Select mandatory assets, then the largest relaxed positions. The
+    // selected direction is scaled to the quadratic minimum on the GPU.
+    __device__ void integer_candidate_device(int tid, int n, const double* x,
+        const double* lb, const double* ub, const uint8_t*, double* candidate) const {
+        for (int j = tid; j < n; j += blockDim.x) candidate[j] = 0.0;
+        __syncthreads();
+        if (tid == 0) {
+            int selected = 0;
+            for (int i = 0; i < assets; ++i)
+                if (lb[MaxAssets + i] > 0.5) {
+                    candidate[MaxAssets + i] = 1.0;
+                    ++selected;
+                }
+            while (selected < cardinality) {
+                int best = -1;
+                for (int i = 0; i < assets; ++i)
+                    if (candidate[MaxAssets + i] == 0.0
+                            && ub[MaxAssets + i] > 0.5 && x[i] > 1e-12
+                            && (best < 0 || x[i] > x[best])) best = i;
+                if (best < 0) break;
+                candidate[MaxAssets + best] = 1.0;
+                ++selected;
             }
-        std::vector<int> optional;
-        for (int i = 0; i < assets; ++i)
-            if (!selected[i] && ub[MaxAssets + i] > 0.5)
-                optional.push_back(i);
-        std::sort(optional.begin(), optional.end(), [&](int a, int b) {
-            return x[a] > x[b] || (x[a] == x[b] && a < b);
-        });
-        for (int i : optional) {
-            if ((int)support.size() >= cardinality || !(x[i] > 1e-12)) break;
-            selected[i] = 1;
-            support.push_back(i);
-        }
-
-        // If the relaxation supplied no direction, seed one feasible asset.
-        bool has_direction = false;
-        for (int i : support) has_direction = has_direction || x[i] > 1e-12;
-        if (!has_direction && (int)support.size() < cardinality) {
-            int best = -1;
-            for (int i : optional)
-                if (best < 0 || host_mu[i] > host_mu[best]) best = i;
-            if (best >= 0 && host_mu[best] > 0.0) {
-                selected[best] = 1;
-                support.push_back(best);
+            bool direction = false;
+            for (int i = 0; i < assets; ++i)
+                if (candidate[MaxAssets + i] == 1.0) {
+                    candidate[i] = fmax(0.0, x[i]);
+                    direction |= candidate[i] > 0.0;
+                }
+            if (!direction) {
+                int best = -1;
+                for (int i = 0; i < assets; ++i)
+                    if ((candidate[MaxAssets + i] == 1.0
+                            || (selected < cardinality && ub[MaxAssets + i] > 0.5))
+                            && (best < 0 || device_mu[i] > device_mu[best])) best = i;
+                if (best >= 0 && device_mu[best] > 0.0) {
+                    candidate[MaxAssets + best] = 1.0;
+                    candidate[best] = 1.0;
+                }
             }
-        }
-        for (int i : support) candidate[MaxAssets + i] = 1.0;
-
-        std::vector<double> direction(assets, 0.0);
-        double max_direction = 0.0;
-        for (int i : support) {
-            direction[i] = std::max(x[i], 0.0);
-            max_direction = std::max(max_direction, direction[i]);
-        }
-        if (!(max_direction > 0.0)) {
-            int best = -1;
-            for (int i : support)
-                if (best < 0 || host_mu[i] > host_mu[best]) best = i;
-            if (best >= 0 && host_mu[best] > 0.0) {
-                direction[best] = 1.0;
-                max_direction = 1.0;
+            double linear = 0.0, quadratic = 0.0, maximum = CUDART_INF;
+            for (int i = 0; i < assets; ++i) {
+                linear += device_mu[i] * candidate[i];
+                if (candidate[i] > 0.0)
+                    maximum = fmin(maximum, device_upper_bounds[i] / candidate[i]);
+                for (int j = 0; j < assets; ++j)
+                    quadratic += candidate[i] * device_H[i * assets + j] * candidate[j];
             }
+            const double scale = linear > 0.0 && quadratic > 0.0
+                ? fmin(linear / quadratic, maximum) : 0.0;
+            for (int i = 0; i < assets; ++i) candidate[i] *= scale;
         }
-        double linear = 0.0, quadratic = 0.0;
-        for (int i = 0; i < assets; ++i) {
-            linear += host_mu[i] * direction[i];
-            for (int j = 0; j < assets; ++j)
-                quadratic += direction[i] * host_H[i * assets + j]
-                           * direction[j];
-        }
-        if (linear > 0.0 && quadratic > 0.0) {
-            double maximum_scale = std::numeric_limits<double>::infinity();
-            for (int i : support)
-                if (direction[i] > 0.0)
-                    maximum_scale = std::min(
-                        maximum_scale, host_upper_bounds[i] / direction[i]);
-            const double scale = std::min(linear / quadratic, maximum_scale);
-            for (int i : support) candidate[i] = scale * direction[i];
-        }
-        return candidate;
+        __syncthreads();
     }
 
-    bool candidate_feasible(
-        const std::vector<double>& x,
-        const std::vector<double>& lb,
-        const std::vector<double>& ub, double tol) const {
-        if (x.size() != Variables) return false;
-        int selected = 0;
-        for (int i = 0; i < assets; ++i) {
+    __device__ bool candidate_feasible_device(int tid, int n, const double* x,
+        const double*, const double*, double tol) const {
+        if (n != Variables) return false;
+        double selected = 0.0;
+        bool valid = true;
+        for (int i = tid; i < assets; i += blockDim.x) {
             const double y = x[MaxAssets + i];
-            if (!std::isfinite(x[i]) || !std::isfinite(y)
-                || x[i] < -tol || x[i] > host_upper_bounds[i] * y + tol
-                || y < lb[MaxAssets+i] - tol || y > ub[MaxAssets+i] + tol
-                || std::abs(y - std::round(y)) > tol)
-                return false;
-            selected += y > 0.5;
+            if (x[i] < -tol || x[i] > device_upper_bounds[i] * y + tol)
+                valid = false;
+            selected += y;
         }
-        return selected <= cardinality;
-    }
-
-    void compute_v_cpu(const std::vector<double>& grad,
-                       const std::vector<double>& lb,
-                       const std::vector<double>& ub,
-                       std::vector<double>& v) const {
-        std::fill(v.begin(), v.end(), 0.0);
-        int mandatory = 0;
-        std::vector<int> optional;
-        for (int i = 0; i < assets; ++i) {
-            if (lb[MaxAssets + i] > 0.5) {
-                ++mandatory;
-            } else if (ub[MaxAssets + i] > 0.5) {
-                const double cost = grad[MaxAssets + i]
-                    + std::min(0.0, host_upper_bounds[i] * grad[i]);
-                if (cost < 0.0)
-                    optional.push_back(i);
-            }
-        }
-        if (mandatory > cardinality)
-            throw std::runtime_error("LinkedCardinalityLMO: infeasible node");
-        std::sort(optional.begin(), optional.end(), [&](int a, int b) {
-            const double ca = grad[MaxAssets+a]
-                + std::min(0.0, host_upper_bounds[a] * grad[a]);
-            const double cb = grad[MaxAssets+b]
-                + std::min(0.0, host_upper_bounds[b] * grad[b]);
-            return ca < cb || (ca == cb && a < b);
-        });
-        int remaining = cardinality - mandatory;
-        for (int i = 0; i < assets; ++i) {
-            if (lb[MaxAssets + i] > 0.5) {
-                v[MaxAssets + i] = 1.0;
-                if (grad[i] < 0.0) v[i] = host_upper_bounds[i];
-            }
-        }
-        for (int i : optional) {
-            if (remaining-- <= 0) break;
-            v[MaxAssets + i] = 1.0;
-            if (grad[i] < 0.0) v[i] = host_upper_bounds[i];
-        }
+        const bool linked_bounds_valid = __syncthreads_and(valid);
+        const double selected_sum = feasibility_block_sum(selected);
+        return linked_bounds_valid && selected_sum <= cardinality + tol;
     }
 
     __device__ void compute_v(int tid, int, const double* grad,
@@ -487,7 +399,7 @@ struct LinkedCardinalityLMO {
 
         for (int i = tid; i < Variables; i += blockDim.x) v[i] = 0.0;
         __syncthreads();
-        // check_feasible() prevents this path.  If bypassed, return zeros;
+        // check_feasible_device() prevents this path.  If bypassed, return zeros;
         // callers must treat that as an invalid oracle result for this node.
         if (mandatory > cardinality)
             return;
@@ -725,7 +637,7 @@ int main(int argc, char** argv) {
         upper_bounds.size() * sizeof(double), cudaMemcpyHostToDevice));
 
     SparseSharpeObjective objective{
-        d_H, d_mu, H.data(), mu.data(), assets};
+        d_H, d_mu, assets};
     Problem problem;
     problem.n_vars = Variables;
     problem.lb.assign(Variables, 0.0);
@@ -736,24 +648,16 @@ int main(int argc, char** argv) {
         problem.ub[MaxAssets + i] = 1.0;
         problem.int_vars.push_back(MaxAssets + i);
     }
-    problem.f = [objective](const std::vector<double>& x) {
-        return objective.f(x);
-    };
-    problem.grad_f = [objective](const std::vector<double>& x,
-                                 std::vector<double>& g) {
-        objective.gradient_host(x, g);
-    };
 
     LinkedCardinalityLMO lmo{
-        assets, opts.cardinality, d_upper_bounds, upper_bounds.data(),
-        H.data(), mu.data()};
+        assets, opts.cardinality, d_upper_bounds,
+        d_H, d_mu};
 
     DeviceResidentConfig cfg;
     cfg.gpu_batch_size = 1024;
     cfg.num_streams = 8;
     cfg.gpu_block_threads = opts.threads;
     cfg.gpu_max_iters = 10000;
-    cfg.serial_iters = 2000;
     cfg.integer_tol = 1e-5;
     cfg.abs_gap_tol = 1e-6;
     cfg.rel_gap_tol = 1e-2;

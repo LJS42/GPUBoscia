@@ -5,7 +5,6 @@
 //   static constexpr int n_vars;
 //   static constexpr int block_threads; // warp-aligned launch upper bound
 //   static constexpr int shared_bytes;
-//   double f(const std::vector<double>& x) const;
 //   __device__ double value_local(int tid, const double* x_node,
 //                                 unsigned char* smem) const;
 //   __device__ void prepare_block(int tid, unsigned char* smem) const;
@@ -15,8 +14,6 @@
 
 #include <cuda_runtime.h>
 #include <cstdint>
-#include <stdexcept>
-#include <vector>
 
 template<int Vars, int Threads = 64>
 struct GlobalCachedDenseQuadraticObjective {
@@ -26,12 +23,9 @@ struct GlobalCachedDenseQuadraticObjective {
     static constexpr int shared_bytes = Vars * (int)sizeof(double) + 16;
 
     // Device matrix is stored transposed: d_Qt[k * Vars + j] == Q[j, k].
-    // Consequently, threads computing adjacent output rows j issue contiguous
-    // loads at each k.  The host matrix keeps the conventional row-major form.
+    // Threads computing adjacent output rows j issue contiguous loads at k.
     const double* d_Qt;
     const double* d_linear;
-    const double* h_Q;
-    const double* h_linear;
     double        grad_scale;
     double        linear_scale;
     double        constant;
@@ -41,36 +35,10 @@ struct GlobalCachedDenseQuadraticObjective {
                                         const double* linear = nullptr,
                                         double grad_scale_ = 1.0,
                                         double linear_scale_ = 1.0,
-                                        double constant_ = 0.0,
-                                        const double* host_Q = nullptr,
-                                        const double* host_linear = nullptr)
+                                        double constant_ = 0.0)
         : d_Qt(Q_transposed), d_linear(linear)
-        , h_Q(host_Q), h_linear(host_linear)
         , grad_scale(grad_scale_), linear_scale(linear_scale_)
         , constant(constant_) {}
-
-    double f(const std::vector<double>& x) const {
-        if (!h_Q)
-            throw std::runtime_error("GlobalCachedDenseQuadraticObjective::f requires host Q");
-
-        double quad = 0.0;
-        for (int j = 0; j < Vars; j++) {
-            double qx_j = 0.0;
-            for (int k = 0; k < Vars; k++)
-                qx_j += h_Q[j * Vars + k] * x[k];
-            quad += x[j] * qx_j;
-        }
-
-        double lin = 0.0;
-        if (h_linear) {
-            for (int j = 0; j < Vars; j++)
-                lin += h_linear[j] * x[j];
-        }
-
-        return 0.5 * grad_scale * quad
-             + grad_scale * linear_scale * lin
-             + constant;
-    }
 
     __device__ double value_local(int tid, const double* x_node,
                                   unsigned char* /*smem*/) const {
@@ -151,8 +119,6 @@ struct ILSGlobalCachedObjective
     __host__ __device__
     ILSGlobalCachedObjective(const double* d_AtA_transposed = nullptr,
                              const double* d_Atb = nullptr,
-                             double btb = 0.0,
-                             const double* h_AtA = nullptr,
-                             const double* h_Atb = nullptr)
-        : Base(d_AtA_transposed, d_Atb, 2.0, -1.0, btb, h_AtA, h_Atb) {}
+                             double btb = 0.0)
+        : Base(d_AtA_transposed, d_Atb, 2.0, -1.0, btb) {}
 };

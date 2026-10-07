@@ -1,8 +1,6 @@
 #pragma once
 #include <vector>
 #include <cmath>
-#include <type_traits>
-#include <utility>
 #include "node.h"
 
 inline bool is_integer_feasible(
@@ -41,27 +39,4 @@ inline bool is_node_feasible(
     }
 
     return true;
-}
-
-template<typename LMO, typename = void>
-struct HasCheckFeasible : std::false_type {};
-
-template<typename LMO>
-struct HasCheckFeasible<LMO, std::void_t<
-    decltype(std::declval<const LMO&>().check_feasible(
-        std::declval<const Node&>(),
-        std::declval<const std::vector<int>&>()))>> : std::true_type {};
-
-template<typename LMO>
-inline bool lmo_check_feasible(
-    const LMO&              lmo,
-    const Node&             node,
-    const std::vector<int>& int_vars)
-{
-    // Public helper for LMO extension points.  Custom LMOs can define
-    // check_feasible(node, int_vars) to override the default box semantics.
-    if constexpr (HasCheckFeasible<LMO>::value)
-        return lmo.check_feasible(node, int_vars);
-    else
-        return is_node_feasible(node, int_vars);
 }

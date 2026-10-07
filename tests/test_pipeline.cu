@@ -54,6 +54,18 @@ static int g_fail = 0;
 // ============================================================
 //  Helpers
 // ============================================================
+// Test-only validation of the returned incumbent; solver checks run on GPU.
+static bool test_exact_integer_candidate(
+    const std::vector<double>& x, const std::vector<int>& int_vars)
+{
+    for (double v : x)
+        if (!std::isfinite(v)) return false;
+    for (int i : int_vars)
+        if (i < 0 || i >= (int)x.size() || x[i] != std::round(x[i]))
+            return false;
+    return true;
+}
+
 static BranchStrategy make_branch_fn() {
     return [](const Node& p, int& nid,
               const std::vector<double>& x,
@@ -422,7 +434,7 @@ static double dot_product(
 }
 
 static Problem make_problem(int n,
-                            const std::vector<double>& c,
+                            const std::vector<double>& /* target */,
                             const std::vector<double>& lb,
                             const std::vector<double>& ub)
 {
@@ -431,14 +443,6 @@ static Problem make_problem(int n,
     p.lb = lb; p.ub = ub;
     p.int_vars.resize(n);
     std::iota(p.int_vars.begin(), p.int_vars.end(), 0);
-    p.f = [c, n](const std::vector<double>& x) {
-        double f = 0.0;
-        for (int j = 0; j < n; j++) { double d = x[j]-c[j]; f += d*d; }
-        return f;
-    };
-    p.grad_f = [c, n](const std::vector<double>& x, std::vector<double>& g) {
-        for (int j = 0; j < n; j++) g[j] = 2.0*(x[j]-c[j]);
-    };
     return p;
 }
 
@@ -647,8 +651,6 @@ static DeviceResidentConfig make_device_cfg(int batch_size = 16,
     cfg.num_streams    = num_streams;
     cfg.gpu_max_iters  = 50000;
     cfg.gpu_eps        = 1e-6;
-    cfg.serial_iters   = 500;
-    cfg.serial_eps     = 1e-5;
     return cfg;
 }
 
@@ -673,7 +675,7 @@ void run_device_resident_case(const char* name,
     Problem prob = make_problem(N, c, lb, ub);
 
     using Objective = ILSGlobalCachedObjective<N>;
-    Objective obj{d_Q, d_c, constant, Q.data(), c.data()};
+    Objective obj{d_Q, d_c, constant};
 
     bool threw = false;
     try {
@@ -708,7 +710,7 @@ void run_device_resident_case(const char* name,
 // ============================================================
 //  Device-resident global-Q tests.
 //  These exercise the user-facing objective API:
-//    Objective::f()    on host
+//    GPU candidate scoring and continuation
 //    Objective::grad() on device
 // ============================================================
 void test_device_resident_n2() {
@@ -733,7 +735,7 @@ void test_completed_slot_refilled_before_postprocessing() {
     Problem prob = make_problem(n, c, lb, ub);
 
     using Objective = ILSGlobalCachedObjective<n>;
-    Objective obj{d_Q, d_c, constant, Q.data(), c.data()};
+    Objective obj{d_Q, d_c, constant};
 
     std::vector<DRSSchedulingEvent> events;
     DeviceResidentHybridSolver<Objective, FrankWolfePolicy>
@@ -794,14 +796,8 @@ void test_empty_frontier_branches_before_postprocessing() {
     double* d_Q = upload_values(Q);
     double* d_c = upload_values(c);
     Problem prob = make_problem(2, c, lb, ub);
-    int host_grad_calls = 0;
-    const auto original_grad = prob.grad_f;
-    prob.grad_f = [&](const std::vector<double>& x, std::vector<double>& g) {
-        ++host_grad_calls;
-        original_grad(x, g);
-    };
     using Objective = ILSGlobalCachedObjective<2>;
-    Objective obj{d_Q, d_c, sumsq(c), Q.data(), c.data()};
+    Objective obj{d_Q, d_c, sumsq(c)};
 
     // The second case supplies the exact integer lower bound: validation
     // finds an incumbent equal to it and prunes an already expanded root.
@@ -838,7 +834,6 @@ void test_empty_frontier_branches_before_postprocessing() {
         EXPECT(solver.dual_bound() <= solver.incumbent_value() + 1e-6,
                "overlapping parent and child work preserves a valid bound");
     }
-    EXPECT(host_grad_calls == 0, "normal GPU results require no host gradient replay");
 
     // Input queue order is the reverse of the bounds from the new relaxation.
     std::vector<int> expanded_roots;
@@ -863,26 +858,21 @@ void test_empty_frontier_branches_before_postprocessing() {
         EXPECT_NEAR(solver.incumbent_value(), 0.5, 1e-6,
                     std::string("GPU certificate path preserves optimum with reordered roots, got ")
                         + std::to_string(solver.incumbent_value()));
-        EXPECT(is_exact_integer_candidate(solver.incumbent_x(), prob.int_vars),
+        EXPECT(test_exact_integer_candidate(solver.incumbent_x(), prob.int_vars),
                "fractional oracle vertex is not stored as the GPU incumbent");
     }
     {
-        // Zero steps return the initial integral vertex with a large final
-        // gap. It must enter CPU refinement instead of closing the root.
-        host_grad_calls = 0;
+        // A one-step budget must not close an uncertified integral node.
         auto cfg = make_device_cfg(2, 1);
-        cfg.gpu_max_iters = 0;
+        cfg.gpu_max_iters = 1;
         DeviceResidentHybridSolver<Objective, FrankWolfePolicy> solver(
             prob, obj, FrankWolfePolicy{}, make_branch_fn(), cfg);
         solver.push(Node(0, -1, 0, lb, ub));
-        solver.push(Node(100, -1, 0, {0.75, 0.75}, ub));
         solver.solve();
-        EXPECT(host_grad_calls > 0,
-               "integral GPU iterate with a large gap triggers CPU refinement");
         EXPECT_NEAR(solver.incumbent_value(), 0.5, 1e-6,
-                    "integral unconverged fallback preserves optimum");
-        EXPECT(is_exact_integer_candidate(solver.incumbent_x(), prob.int_vars),
-               "CPU refinement also rejects fractional oracle incumbents");
+                    "short GPU batches preserve optimum");
+        EXPECT(test_exact_integer_candidate(solver.incumbent_x(), prob.int_vars),
+               "GPU candidate scoring returns exact integer incumbents");
     }
     cudaFree(d_Q);
     cudaFree(d_c);
@@ -934,7 +924,7 @@ void test_simplex_lmo_device_resident_n4() {
     Problem prob = make_problem(n, c, lb, ub);
 
     using Objective = ILSGlobalCachedObjective<n>;
-    Objective obj{d_Q, d_c, constant, Q.data(), c.data()};
+    Objective obj{d_Q, d_c, constant};
     UnitSimplexLMO<n> lmo((double)rhs, n, prob.int_vars);
 
     DeviceResidentHybridSolver<Objective, FrankWolfePolicy, UnitSimplexLMO<n>>
@@ -988,7 +978,7 @@ void test_birkhoff_paired_device_resident() {
     double* d_c = upload_values(target);
     Problem prob = make_problem(n, target, lb, ub);
     using Objective = ILSGlobalCachedObjective<n>;
-    Objective obj{d_Q, d_c, sumsq(target), Q.data(), target.data()};
+    Objective obj{d_Q, d_c, sumsq(target)};
     auto cfg = make_device_cfg(4, 1);
     cfg.dicg_oracle_parallelism =
         DeviceResidentConfig::DICGOracleParallelism::Paired;
@@ -1027,8 +1017,7 @@ static void run_equality_simplex_convergence_case(
     double* d_Q = upload_values(Q_transposed);
     double* d_linear = upload_values(linear);
     using Objective = GlobalCachedDenseQuadraticObjective<n, 256>;
-    Objective obj{d_Q, d_linear, 1.0, 1.0, constant,
-                  Q.data(), linear.data()};
+    Objective obj{d_Q, d_linear, 1.0, 1.0, constant};
     EqualitySimplexLMO<n> lmo(rhs, n, prob.int_vars);
 
     DeviceResidentConfig cfg = make_device_cfg(1, 1);
@@ -1111,23 +1100,6 @@ static void test_equality_simplex_algorithm_convergence_matrix()
     prob.ub = ub;
     prob.int_vars.resize(n);
     std::iota(prob.int_vars.begin(), prob.int_vars.end(), 0);
-    prob.f = [Q, linear, constant](const std::vector<double>& x) {
-        double value = constant;
-        for (int j = 0; j < n; ++j) {
-            value += linear[j] * x[j];
-            for (int k = 0; k < n; ++k)
-                value += 0.5 * x[j] * Q[j*n+k] * x[k];
-        }
-        return value;
-    };
-    prob.grad_f = [Q, linear](const std::vector<double>& x,
-                              std::vector<double>& grad) {
-        for (int j = 0; j < n; ++j) {
-            grad[j] = linear[j];
-            for (int k = 0; k < n; ++k)
-                grad[j] += Q[j*n+k] * x[k];
-        }
-    };
 
     constexpr int max_iters = 20000;
     constexpr double eps = 1e-4;
@@ -1179,19 +1151,12 @@ static SecantToleranceProbeResult run_secant_tolerance_probe(SecantLS ls)
 
     using Objective = GlobalCachedDenseQuadraticObjective<n, 32>;
     Objective objective{
-        d_Q, d_linear, 1.0, 1.0, 0.0, Q.data(), linear.data()};
+        d_Q, d_linear, 1.0, 1.0, 0.0};
 
     Problem problem;
     problem.n_vars = n;
     problem.lb = lb;
     problem.ub = ub;
-    problem.f = [Q, linear](const std::vector<double>& x) {
-        return 0.5 * Q[0] * x[0] * x[0] + linear[0] * x[0];
-    };
-    problem.grad_f = [Q, linear](const std::vector<double>& x,
-                                  std::vector<double>& grad) {
-        grad[0] = Q[0] * x[0] + linear[0];
-    };
 
     DeviceResidentConfig cfg = make_device_cfg(1, 1);
     cfg.gpu_max_iters = 64;
@@ -1201,7 +1166,7 @@ static SecantToleranceProbeResult run_secant_tolerance_probe(SecantLS ls)
         const std::vector<int>&) { return std::vector<Node>{}; };
 
     DeviceResidentHybridSolver<Objective, DICGSecant> solver(
-        problem, objective, DICGSecant{ls}, no_branch, cfg);
+        problem, objective, DICGSecant{ls}, no_branch, cfg, BoxLMO{}, 0.25);
     Node root(0, -1, 0, lb, ub);
     root.dual_bound = -1e300;
     solver.push(root);
@@ -1232,7 +1197,7 @@ static void test_secant_tolerance_stall_regression()
               << " converged=" << (tight.converged ? "yes" : "NO") << "\n";
 
     EXPECT(!sparse_defaults.converged
-               && sparse_defaults.iterations == 64
+               && sparse_defaults.iterations >= 64
                && sparse_defaults.gap > 1e-6,
            "sparse-Sharpe secant defaults reproduce the zero-step stall");
     EXPECT(tight.converged && tight.iterations < 64 && tight.gap < 1e-6,
@@ -1276,7 +1241,7 @@ static void test_quadratic_exact_device() {
     const std::vector<double> Q{1,0,0,1}, target{0.25,0.75};
     DeviceBuffer dQ(Q), dTarget(target);
     using Objective = ILSGlobalCachedObjective<2>;
-    Objective objective{dQ.p, dTarget.p, sumsq(target), Q.data(), target.data()};
+    Objective objective{dQ.p, dTarget.p, sumsq(target)};
     Problem problem = make_problem(2, target, {0,0}, {1,1});
     EqualitySimplexLMO<2> lmo(1.0, 2, problem.int_vars);
     BranchStrategy no_branch = [](const Node&, int&, const std::vector<double>&,
@@ -1305,6 +1270,365 @@ static void test_quadratic_exact_device() {
 
 }
 
+// One-node kernel fixture. A zero budget here probes initialization/final
+// scoring only; the public solver requires a positive per-dispatch budget.
+struct GPUNodeProbe {
+    DRSStreamSlot slot;
+    int n;
+    size_t stride;
+    explicit GPUNodeProbe(int variables, int objective_bytes)
+        : n(variables), stride(size_t(objective_bytes) + 16) {
+        slot.alloc(1, n, 6, stride);
+    }
+    ~GPUNodeProbe() { slot.free_all(); }
+    void initialize(const std::vector<double>& x, const std::vector<double>& lb,
+                    const std::vector<double>& ub, const std::vector<int>& integers,
+                    int iterations = 0) {
+        std::copy(x.begin(), x.end(), slot.h_x);
+        std::copy(lb.begin(), lb.end(), slot.h_lb);
+        std::copy(ub.begin(), ub.end(), slot.h_ub);
+        std::fill(slot.h_integer_flags, slot.h_integer_flags + n, uint8_t(0));
+        for (int j : integers) slot.h_integer_flags[j] = 1;
+        slot.h_iterations[0] = iterations;
+        slot.h_eps[0] = 1e-12;
+        DRS_CUDA_CHECK(cudaMemcpy(slot.d_x, slot.h_x, n * sizeof(double), cudaMemcpyHostToDevice));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.d_lb, slot.h_lb, n * sizeof(double), cudaMemcpyHostToDevice));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.d_ub, slot.h_ub, n * sizeof(double), cudaMemcpyHostToDevice));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.d_integer_flags, slot.h_integer_flags, n, cudaMemcpyHostToDevice));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.d_iterations, slot.h_iterations, sizeof(int), cudaMemcpyHostToDevice));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.d_eps, slot.h_eps, sizeof(double), cudaMemcpyHostToDevice));
+    }
+    template<typename Objective, typename Algorithm, typename LMO,
+             typename Heuristic = gpuboscia::RoundingHeuristic>
+    void run(Objective obj, Algorithm alg, LMO lmo, int budget, bool paired = false,
+             Heuristic heuristic = {}) {
+        double tol = 1e-6;
+        int count = 1;
+        if constexpr (DRSUsesDICG<Algorithm>::value) {
+            if (paired) {
+                void* args[] = {&obj, &alg, &lmo, &slot.d_x, &slot.d_lb, &slot.d_ub,
+                    &slot.d_gap, &slot.d_value, &slot.d_iterations, &slot.d_cnv,
+                    &slot.d_best_vertex, &slot.d_best_vertex_val, &slot.d_workspace,
+                    &slot.d_objective_workspace, &stride, &count, &budget, &slot.d_eps,
+                    &slot.d_all_done, &slot.d_integer_flags, &tol, &heuristic};
+                DRS_CUDA_CHECK(cudaLaunchCooperativeKernel(
+                    (void*)drs_dicg_paired_batch_kernel<Objective, Algorithm, LMO, Heuristic>,
+                    dim3(2), dim3(32), args, sizeof(double), slot.stream));
+            } else {
+                drs_fw_relax_batch_kernel<Objective, Algorithm, LMO, Heuristic>
+                    <<<1, 32, sizeof(double), slot.stream>>>(obj, alg, lmo,
+                        slot.d_x, slot.d_lb, slot.d_ub, slot.d_gap, slot.d_value,
+                        slot.d_iterations, slot.d_cnv, slot.d_best_vertex,
+                        slot.d_best_vertex_val, slot.d_workspace,
+                        slot.d_objective_workspace, stride, count, budget,
+                        slot.d_eps, slot.d_integer_flags, tol, heuristic);
+            }
+        } else {
+            drs_fw_relax_batch_kernel<Objective, Algorithm, LMO, Heuristic>
+                <<<1, 32, sizeof(double), slot.stream>>>(obj, alg, lmo,
+                    slot.d_x, slot.d_lb, slot.d_ub, slot.d_gap, slot.d_value,
+                    slot.d_iterations, slot.d_cnv, slot.d_best_vertex,
+                    slot.d_best_vertex_val, slot.d_workspace,
+                    slot.d_objective_workspace, stride, count, budget,
+                    slot.d_eps, slot.d_integer_flags, tol, heuristic);
+        }
+        DRS_CUDA_CHECK(cudaGetLastError());
+        DRS_CUDA_CHECK(cudaStreamSynchronize(slot.stream));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.h_x, slot.d_x, n * sizeof(double), cudaMemcpyDeviceToHost));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.h_best_vertex, slot.d_best_vertex, n * sizeof(double), cudaMemcpyDeviceToHost));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.h_best_vertex_val, slot.d_best_vertex_val, sizeof(double), cudaMemcpyDeviceToHost));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.h_iterations, slot.d_iterations, sizeof(int), cudaMemcpyDeviceToHost));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.h_gap, slot.d_gap, sizeof(double), cudaMemcpyDeviceToHost));
+        DRS_CUDA_CHECK(cudaMemcpy(slot.h_cnv, slot.d_cnv, sizeof(uint8_t), cudaMemcpyDeviceToHost));
+    }
+};
+
+// A stateful custom heuristic demonstrates that the kernel receives user data.
+struct FloorHeuristic {
+    double offset = 0.0;
+    template<typename LMO>
+    __device__ void generate(const LMO&, int tid, int n, const double* x,
+        const double*, const double*, const std::uint8_t* flags,
+        double* candidate) const {
+        for (int j = tid; j < n; j += blockDim.x)
+            candidate[j] = flags[j] ? floor(x[j]) + offset : x[j];
+    }
+};
+
+static void test_custom_heuristic() {
+    std::cout << "\n[Custom GPU candidate heuristic]\n";
+    using Objective = ILSGlobalCachedObjective<2, 32>;
+    const std::vector<double> target{0.3, 0.4};
+    DeviceBuffer matrix(identity_matrix(2)), linear(target);
+    Objective obj{matrix.p, linear.p, sumsq(target)};
+    cudaDeviceProp prop{};
+    DRS_CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    auto check = [&](auto algorithm, bool paired) {
+        GPUNodeProbe normal(2, Objective::shared_bytes);
+        GPUNodeProbe custom(2, Objective::shared_bytes);
+        GPUNodeProbe invalid(2, Objective::shared_bytes);
+        for (auto* probe : {&normal, &custom, &invalid})
+            probe->initialize({0.6,0.4}, {0,0}, {1,1}, {0}, 1);
+        normal.run(obj, algorithm, BoxLMO{}, 0, paired);
+        custom.run(obj, algorithm, BoxLMO{}, 0, paired, FloorHeuristic{});
+        invalid.run(obj, algorithm, BoxLMO{}, 0, paired, FloorHeuristic{2.0});
+        EXPECT_NEAR(normal.slot.h_best_vertex_val[0], 0.45, 1e-12,
+                    "default rounding preserves existing candidate behavior");
+        EXPECT_NEAR(custom.slot.h_best_vertex_val[0], 0.09, 1e-12,
+                    "custom floor heuristic replaces rounding and preserves continuous coordinate");
+        EXPECT_NEAR(invalid.slot.h_best_vertex_val[0], 0.45, 1e-12,
+                    "out-of-bounds custom candidate is rejected");
+    };
+    check(FrankWolfeOpenLoop{}, false);
+    check(DICGOpenLoop{}, false);
+    if (prop.cooperativeLaunch) check(DICGOpenLoop{}, true);
+
+    const auto problem = make_problem(2, target, {0,0}, {1,1});
+    auto settings = gpuboscia::create_default_settings();
+    settings.device = make_device_cfg(1, 1);
+    settings.device.dicg_oracle_parallelism =
+        DeviceResidentConfig::DICGOracleParallelism::Serial;
+    settings.time_limit_seconds = 5.0;
+    const auto result = gpuboscia::solve(
+        problem, obj, BoxLMO{}, settings, FloorHeuristic{});
+    EXPECT_NEAR(result.objective, 0.25, 1e-9,
+                "public solve accepts a custom GPU candidate heuristic");
+}
+
+static void test_gpu_continuation_and_rounding() {
+    std::cout << "\n[GPU continuation and candidate scoring]\n";
+    const std::vector<double> Q = identity_matrix(2), target{0.3, 0.4};
+    DeviceBuffer dQ(Q), dTarget(target);
+    using Objective = ILSGlobalCachedObjective<2, 32>;
+    Objective obj{dQ.p, dTarget.p, sumsq(target)};
+    cudaDeviceProp prop{};
+    DRS_CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    auto compare = [&](auto algorithm, bool paired) {
+        GPUNodeProbe split(2, Objective::shared_bytes), whole(2, Objective::shared_bytes);
+        split.initialize({0,0}, {0,0}, {1,1}, {0,1});
+        whole.initialize({0,0}, {0,0}, {1,1}, {0,1});
+        split.run(obj, algorithm, BoxLMO{}, 1, paired);
+        EXPECT(split.slot.h_cnv[0] == DRSIntegralUnconverged,
+               "one-step integral result lacks a certificate");
+        split.run(obj, algorithm, BoxLMO{}, 1, paired);
+        whole.run(obj, algorithm, BoxLMO{}, 2, paired);
+        EXPECT(split.slot.h_iterations[0] == 2, "resumption retains cumulative iterations");
+        EXPECT_NEAR(split.slot.h_x[0], 2.0 / 3.0, 1e-12,
+                    "second dispatch keeps both iterate and step schedule");
+        for (int j = 0; j < 2; ++j)
+            EXPECT_NEAR(split.slot.h_x[j], whole.slot.h_x[j], 1e-12,
+                        "split GPU execution matches uninterrupted execution");
+        EXPECT_NEAR(split.slot.h_gap[0], whole.slot.h_gap[0], 1e-12,
+                    "resumed certificate matches uninterrupted execution");
+    };
+    compare(FrankWolfeOpenLoop{}, false);
+    compare(DICGOpenLoop{}, false);
+    if (prop.cooperativeLaunch) compare(DICGOpenLoop{}, true);
+
+    GPUNodeProbe mixed(2, Objective::shared_bytes);
+    mixed.initialize({0.3,0.4}, {0,0}, {1,1}, {0}, 5);
+    mixed.run(obj, FrankWolfeOpenLoop{}, BoxLMO{}, 0);
+    EXPECT_NEAR(mixed.slot.h_best_vertex[0], 0.0, 1e-12, "GPU rounds integer coordinate");
+    EXPECT_NEAR(mixed.slot.h_best_vertex[1], 0.4, 1e-12, "GPU preserves continuous coordinate");
+    EXPECT_NEAR(mixed.slot.h_best_vertex_val[0], 0.09, 1e-12,
+                "GPU scores rounded candidate better than the LMO vertex");
+
+    GPUNodeProbe equality(2, Objective::shared_bytes);
+    equality.initialize({0.5,0.5}, {0,0}, {1,1}, {0,1}, 5);
+    EqualitySimplexLMO<2> simplex(1.0, 2, {0,1});
+    equality.run(obj, FrankWolfeOpenLoop{}, simplex, 0);
+    EXPECT_NEAR(equality.slot.h_best_vertex[0] + equality.slot.h_best_vertex[1],
+                1.0, 1e-12, "GPU rejects rounded candidate violating simplex equality");
+}
+
+struct GPURejectAllLMO : BoxLMO {
+    __device__ bool check_feasible_device(int, int, const double*, const double*,
+        const uint8_t*, double*, double*) const { return false; }
+};
+
+// More coordinates than threads, multiple warps and a partial final warp.
+// Record each thread's answer to verify block-uniform early-exit decisions.
+__global__ void parallel_feasibility_probe(double* output) {
+    constexpr int n = 65;
+    __shared__ double lb[n], ub[n], x[n], vertex[n], direction[n];
+    __shared__ std::uint8_t flags[n];
+    const int tid = threadIdx.x;
+    for (int j = tid; j < n; j += blockDim.x) {
+        lb[j] = j == n - 1 ? 2.0 : 0.0;
+        ub[j] = 1.0;
+        x[j] = j == n - 1 ? 0.5 : 0.0;
+        flags[j] = 1;
+    }
+    __syncthreads();
+    const bool box = drs_node_feasible(
+        BoxLMO{}, tid, n, lb, ub, flags, vertex, direction);
+    const bool integral = drs_near_integer(tid, n, x, flags, 1e-9);
+    const bool equality = drs_rounded_feasible(
+        EqualitySimplexLMO<n>{}, tid, n, x, lb, ub, 1e-9);
+    const bool inequality = drs_rounded_feasible(
+        UnitSimplexLMO<n>{}, tid, n, x, lb, ub, 1e-9);
+    const double sum = feasibility_block_sum(tid + 1.0);
+    output[5 * tid] = box;
+    output[5 * tid + 1] = integral;
+    output[5 * tid + 2] = equality;
+    output[5 * tid + 3] = inequality;
+    output[5 * tid + 4] = sum;
+}
+
+static void test_parallel_feasibility() {
+    std::cout << "\n[Parallel feasibility reductions and block-uniform results]\n";
+    for (int threads : {32, 48, 64, 128}) {
+        DeviceBuffer output(size_t(5 * threads));
+        parallel_feasibility_probe<<<1, threads>>>(output.p);
+        DRS_CUDA_CHECK(cudaGetLastError());
+        std::vector<double> result(5 * threads);
+        DRS_CUDA_CHECK(cudaMemcpy(result.data(), output.p,
+            result.size() * sizeof(double), cudaMemcpyDeviceToHost));
+        bool correct = true;
+        for (int tid = 0; tid < threads; ++tid)
+            correct &= result[5 * tid] == 0 && result[5 * tid + 1] == 0
+                && result[5 * tid + 2] == 0 && result[5 * tid + 3] == 1
+                && result[5 * tid + 4] == threads * (threads + 1) / 2.0;
+        EXPECT(correct, "parallel feasibility checks return uniform results across all threads");
+    }
+}
+
+static void test_gpu_node_feasibility() {
+    std::cout << "\n[GPU node feasibility before objective evaluation]\n";
+    // Null objective data makes an accidental evaluation fail the test.
+    using Objective = ILSGlobalCachedObjective<2, 32>;
+    Objective obj{};
+    GPUNodeProbe probe(2, Objective::shared_bytes);
+    auto check = [&](const std::vector<double>& lb, const std::vector<double>& ub,
+                     const std::vector<int>& integers, auto lmo, bool paired) {
+        probe.initialize(lb, lb, ub, integers);
+        if (paired) probe.run(obj, DICGOpenLoop{}, lmo, 1, true);
+        else probe.run(obj, FrankWolfeOpenLoop{}, lmo, 1);
+        EXPECT(probe.slot.h_cnv[0] == DRSInfeasible,
+               "GPU rejects infeasible node before reading objective data");
+        EXPECT(probe.slot.h_iterations[0] == 0, "infeasible node performs no FW iterations");
+        EXPECT(probe.slot.h_best_vertex_val[0] >= 1e299, "infeasible node has no incumbent candidate");
+    };
+    cudaDeviceProp prop{};
+    DRS_CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    for (bool paired : {false, true}) {
+        if (paired && !prop.cooperativeLaunch) continue;
+        check({2,0}, {1,1}, {0,1}, BoxLMO{}, paired);
+        check({1.2,0}, {1.8,1}, {0}, BoxLMO{}, paired);
+        check({0.75,0.75}, {1,1}, {}, EqualitySimplexLMO<2>(1.0, 2, {}), paired);
+        check({0,0}, {1,1}, {0,1}, GPURejectAllLMO{}, paired);
+    }
+    using AssignmentObjective = ILSGlobalCachedObjective<4, 32>;
+    GPUNodeProbe assignment(4, AssignmentObjective::shared_bytes);
+    for (bool paired : {false, true}) {
+        if (paired && !prop.cooperativeLaunch) continue;
+        assignment.initialize({0,0,0,0}, {0,0,0,0}, {1,0,1,0}, {0,1,2,3});
+        if (paired)
+            assignment.run(AssignmentObjective{}, DICGOpenLoop{}, BirkhoffLMO<2>{}, 1, true);
+        else
+            assignment.run(AssignmentObjective{}, FrankWolfeOpenLoop{}, BirkhoffLMO<2>{}, 1);
+        EXPECT(assignment.slot.h_cnv[0] == DRSInfeasible,
+               "GPU detects infeasible assignment even when each row has an allowed edge");
+        EXPECT(assignment.slot.h_iterations[0] == 0,
+               "infeasible assignment performs no FW iterations");
+        EXPECT(assignment.slot.h_best_vertex_val[0] >= 1e299,
+               "infeasible assignment has no incumbent candidate");
+    }
+}
+
+static void test_wide_gpu_node_feasibility() {
+    std::cout << "\n[Parallel GPU node feasibility across 65 coordinates]\n";
+    constexpr int n = 65;
+    using Objective = ILSGlobalCachedObjective<n, 32>;
+    GPUNodeProbe probe(n, Objective::shared_bytes);
+    cudaDeviceProp prop{};
+    DRS_CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    auto check = [&](const std::vector<double>& lb, const std::vector<double>& ub,
+                     const std::vector<int>& integers, auto lmo, bool paired) {
+        probe.initialize(lb, lb, ub, integers);
+        // Objective pointers intentionally null: rejection must precede evaluation.
+        if (paired) probe.run(Objective{}, DICGOpenLoop{}, lmo, 1, true);
+        else probe.run(Objective{}, FrankWolfeOpenLoop{}, lmo, 1);
+        EXPECT(probe.slot.h_cnv[0] == DRSInfeasible,
+               "wide node is rejected before objective access");
+        EXPECT(probe.slot.h_iterations[0] == 0,
+               "wide infeasible node performs no iterations");
+        EXPECT(probe.slot.h_best_vertex_val[0] >= 1e299,
+               "wide infeasible node produces no incumbent");
+    };
+    for (bool paired : {false, true}) {
+        if (paired && !prop.cooperativeLaunch) continue;
+        std::vector<double> lb(n, 0.0), ub(n, 1.0);
+        lb.back() = 2.0;
+        check(lb, ub, {}, BoxLMO{}, paired);
+        lb.back() = 1.2;
+        ub.back() = 1.8;
+        check(lb, ub, {n - 1}, BoxLMO{}, paired);
+        lb.assign(n, 0.02);
+        ub.assign(n, 1.0);
+        check(lb, ub, {}, UnitSimplexLMO<n>{}, paired);
+        lb.assign(n, 0.0);
+        ub.assign(n, 0.01);
+        check(lb, ub, {}, EqualitySimplexLMO<n>{}, paired);
+    }
+}
+
+static void test_gpu_feasibility_mixed_batch() {
+    const std::vector<double> Q = identity_matrix(2), target{0.3,0.4};
+    DeviceBuffer dQ(Q), dTarget(target);
+    using Objective = ILSGlobalCachedObjective<2, 32>;
+    Objective obj{dQ.p, dTarget.p, sumsq(target)};
+    Problem problem = make_problem(2, target, {0,0}, {1,1});
+    cudaDeviceProp prop{};
+    DRS_CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
+    auto run = [&](auto algorithm, bool paired) {
+        auto cfg = make_device_cfg(2, 1);
+        cfg.dicg_oracle_parallelism = paired
+            ? DeviceResidentConfig::DICGOracleParallelism::Paired
+            : DeviceResidentConfig::DICGOracleParallelism::Serial;
+        DeviceResidentHybridSolver<Objective, decltype(algorithm)> solver(
+            problem, obj, algorithm, make_branch_fn(), cfg, BoxLMO{}, 5.0);
+        solver.push(Node(0, -1, 0, {0,0}, {1,1}));
+        solver.push(Node(100, -1, 0, {1.2,0}, {1.8,1}));
+        solver.solve();
+        EXPECT_NEAR(solver.incumbent_value(), 0.25, 1e-9,
+                    "mixed batch discards infeasible node and preserves optimum");
+        EXPECT(!solver.reached_time_limit(), "mixed feasible/infeasible grid completes");
+        if (paired) EXPECT(solver.paired_gpu_batches() > 0,
+                           "mixed batch exercises paired grid barriers");
+    };
+    run(FrankWolfeOpenLoop{}, false);
+    if (prop.cooperativeLaunch) run(DICGOpenLoop{}, true);
+}
+
+static void test_resume_queue_dispatch() {
+    std::cout << "\n[Uncertified integral node requeue]\n";
+    const std::vector<double> Q{1.0}, target{0.3};
+    DeviceBuffer dQ(Q), dTarget(target);
+    using Objective = ILSGlobalCachedObjective<1, 32>;
+    Objective obj{dQ.p, dTarget.p, sumsq(target)};
+    Problem problem = make_problem(1, target, {0}, {1});
+    bool resumed = false;
+    auto branch = [&](const Node& node, int& id, const std::vector<double>& x,
+                      const std::vector<int>& integers) {
+        if (node.id == 0) {
+            resumed = node.relaxation_iterations == 1;
+            EXPECT_NEAR(x[0], 2.0 / 3.0, 1e-12, "requeued root continues its open-loop schedule");
+            EXPECT(node.dual_bound >= -0.51 - 1e-12, "requeued root preserves its prior bound");
+        }
+        return branch_pow2(node, id, x, integers, 1);
+    };
+    auto cfg = make_device_cfg(1, 1);
+    cfg.gpu_max_iters = 1;
+    DeviceResidentHybridSolver<Objective, FrankWolfeOpenLoop> solver(
+        problem, obj, FrankWolfeOpenLoop{}, branch, cfg, BoxLMO{}, 5.0);
+    solver.push(Node(0, -1, 0, problem.lb, problem.ub));
+    solver.solve();
+    EXPECT(resumed, "same root is requeued and resumed before branching");
+    EXPECT_NEAR(solver.incumbent_value(), 0.09, 1e-12, "GPU-only refinement preserves optimum");
+    EXPECT(!solver.reached_time_limit(), "GPU continuation completes the search");
+}
+
 int main() {
     std::cout << "=== GPUBoscia Device-Resident Solver Tests ===\n";
     test_equality_simplex_lmo_host_interface();
@@ -1318,6 +1642,13 @@ int main() {
     cudaGetDeviceProperties(&prop, 0);
     std::cout << "GPU: " << prop.name << "\n";
     try {
+        test_custom_heuristic();
+        test_gpu_continuation_and_rounding();
+        test_parallel_feasibility();
+        test_gpu_node_feasibility();
+        test_wide_gpu_node_feasibility();
+        test_gpu_feasibility_mixed_batch();
+        test_resume_queue_dispatch();
         test_quadratic_exact_device();
         test_equality_simplex_lmo_against_enumeration();
         test_birkhoff_lmo_gpu_against_cpu();

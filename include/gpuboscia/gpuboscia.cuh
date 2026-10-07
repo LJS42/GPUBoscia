@@ -49,13 +49,15 @@ template<typename LMO>
 struct lmo_supports_dicg<LMO, std::void_t<decltype(LMO::supports_dicg)>>
     : std::integral_constant<bool, LMO::supports_dicg> {};
 
-template<typename DeviceObjective, typename Algorithm, typename LMO>
+template<typename DeviceObjective, typename Algorithm, typename LMO,
+         typename Heuristic = RoundingHeuristic>
 Result solve_with_algorithm(
     const Problem& problem,
     DeviceObjective objective,
     LMO lmo,
     const Settings& settings,
-    Algorithm algorithm)
+    Algorithm algorithm,
+    Heuristic heuristic = {})
 {
     BranchStrategy branch = settings.branch;
     if (!branch) {
@@ -68,9 +70,9 @@ Result solve_with_algorithm(
             };
     }
 
-    DeviceResidentHybridSolver<DeviceObjective, Algorithm, LMO> solver(
+    DeviceResidentHybridSolver<DeviceObjective, Algorithm, LMO, Heuristic> solver(
         problem, objective, algorithm, branch, settings.device, lmo,
-        settings.time_limit_seconds);
+        settings.time_limit_seconds, heuristic);
     if (settings.progress)
         solver.set_progress_callback(settings.progress);
 
@@ -94,15 +96,16 @@ Result solve_with_algorithm(
         solver.reached_time_limit()};
 }
 
-// Public solver entry point.  `problem` owns the host objective/gradient used
-// for certificate validation and branching; `objective` is its CUDA-callable
-// counterpart used by the device-resident relaxation kernel.
-template<typename DeviceObjective, typename LMO>
+// Public solver entry point. `problem` describes variables and bounds;
+// `objective` supplies all objective values and gradients on the GPU.
+template<typename DeviceObjective, typename LMO,
+         typename Heuristic = RoundingHeuristic>
 Result solve(
     const Problem& problem,
     DeviceObjective objective,
     LMO lmo,
-    const Settings& settings = create_default_settings())
+    const Settings& settings = create_default_settings(),
+    Heuristic heuristic = {})
 {
     if (settings.line_search.kind == LineSearchKind::QuadraticExact) {
         if constexpr (!SupportsQuadraticExact<DeviceObjective>::value) {
@@ -112,12 +115,12 @@ Result solve(
             if (settings.algorithm == FWAlgorithmKind::DICG) {
                 if constexpr (lmo_supports_dicg<LMO>::value)
                     return solve_with_algorithm(problem, objective, lmo, settings,
-                                                DICGQuadraticExact{});
+                                                DICGQuadraticExact{}, heuristic);
                 else
                     throw std::invalid_argument("the selected LMO does not support DICG");
             }
             return solve_with_algorithm(problem, objective, lmo, settings,
-                                        FrankWolfeQuadraticExact{});
+                                        FrankWolfeQuadraticExact{}, heuristic);
         }
     }
     if (settings.algorithm == FWAlgorithmKind::DICG) {
@@ -130,16 +133,16 @@ Result solve(
                     DICGSecant{SecantLS{
                         settings.line_search.secant_iters,
                         settings.line_search.secant_tol,
-                        settings.line_search.secant_denom_eps}});
+                        settings.line_search.secant_denom_eps}}, heuristic);
             if (settings.line_search.kind == LineSearchKind::ScaledOpenLoop)
                 return solve_with_algorithm(
-                    problem, objective, lmo, settings, DICGScaledOpenLoop{});
+                    problem, objective, lmo, settings, DICGScaledOpenLoop{}, heuristic);
             if (settings.line_search.kind
                     == LineSearchKind::SafeguardedScaledOpenLoop)
                 return solve_with_algorithm(problem, objective, lmo, settings,
-                    DICGSafeguardedScaledOpenLoop{});
+                    DICGSafeguardedScaledOpenLoop{}, heuristic);
             return solve_with_algorithm(
-                problem, objective, lmo, settings, DICGOpenLoop{});
+                problem, objective, lmo, settings, DICGOpenLoop{}, heuristic);
         }
     }
 
@@ -153,10 +156,10 @@ Result solve(
             FrankWolfeSecant{SecantLS{
                 settings.line_search.secant_iters,
                 settings.line_search.secant_tol,
-                settings.line_search.secant_denom_eps}});
+                settings.line_search.secant_denom_eps}}, heuristic);
     }
     return solve_with_algorithm(
-        problem, objective, lmo, settings, FrankWolfeOpenLoop{});
+        problem, objective, lmo, settings, FrankWolfeOpenLoop{}, heuristic);
 }
 
 } // namespace gpuboscia

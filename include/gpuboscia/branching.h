@@ -101,6 +101,8 @@ inline std::vector<Node> branch_pow2(
         child.depth      = parent.depth + 1;
         child.dual_bound = parent.dual_bound;
         child.status     = NodeStatus::Active;
+        child.relaxation_x.clear();
+        child.relaxation_iterations = 0;
 
         for (int b = 0; b < actual_k; b++) {
             const int    vidx = vars[b];

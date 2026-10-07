@@ -17,10 +17,8 @@
 #include <gpuboscia/node.h>
 #include <gpuboscia/node_select.h>
 #include <gpuboscia/branching.h>
-#include <gpuboscia/heuristics.h>
 #include <gpuboscia/gap_utils.h>
 #include <gpuboscia/problem.h>
-#include <gpuboscia/cpu_relax.h>
 #include <gpuboscia/tree.h>
 #include <gpuboscia/concurrent_queue.h>
 
@@ -89,16 +87,6 @@ void test_is_integer_feasible() {
 void test_is_node_feasible() {
     std::cout << "\n[is_node_feasible]\n";
 
-    struct FallbackLMO {};
-    struct RejectAllLMO {
-        bool check_feasible(
-            const Node&,
-            const std::vector<int>&) const
-        {
-            return false;
-        }
-    };
-
     EXPECT(is_node_feasible(Node(1, -1, 0, {0.0, 1.0}, {3.0, 2.0}), {0, 1}),
            "non-empty integer box is feasible");
     EXPECT(!is_node_feasible(Node(2, -1, 0, {2.0}, {1.0}), {0}),
@@ -110,40 +98,10 @@ void test_is_node_feasible() {
     EXPECT(!is_node_feasible(Node(5, -1, 0, {0.0, 1.0}, {1.0}), {0}),
            "mismatched bound vector sizes are infeasible");
 
-    Node feasible_box(6, -1, 0, {0.0}, {1.0});
-    EXPECT(lmo_check_feasible(FallbackLMO{}, feasible_box, {0}),
-           "LMO without check_feasible falls back to box feasibility");
-    EXPECT(!lmo_check_feasible(RejectAllLMO{}, feasible_box, {0}),
-           "LMO check_feasible overrides default box feasibility");
+
 }
 
-void test_rounding_heuristics() {
-    std::cout << "\n[rounding heuristics]\n";
 
-    const auto rounded = round_integer_candidate(
-        {0.49, 1.51, 0.25}, {0, 1});
-    EXPECT(std::abs(rounded[0] - 0.0) < 1e-12,
-           "first integer coordinate rounds down");
-    EXPECT(std::abs(rounded[1] - 2.0) < 1e-12,
-           "second integer coordinate rounds up");
-    EXPECT(std::abs(rounded[2] - 0.25) < 1e-12,
-           "continuous coordinate is unchanged");
-
-    EXPECT(is_box_point_feasible(rounded, {0.0, 0.0, 0.0},
-                                 {2.0, 2.0, 1.0}),
-           "rounded candidate satisfies box bounds");
-    EXPECT(!is_box_point_feasible({0.0, 3.0}, {0.0, 0.0}, {2.0, 2.0}),
-           "box candidate outside an upper bound is rejected");
-
-    EXPECT(is_simplex_point_feasible(
-               {1.0, 2.0, 0.25}, {0.0, 0.0, 0.0},
-               {2.0, 2.0, 1.0}, 4.0),
-           "rounded candidate satisfies bounded simplex");
-    EXPECT(!is_simplex_point_feasible(
-               {1.0, 2.0, 1.25}, {0.0, 0.0, 0.0},
-               {2.0, 2.0, 2.0}, 4.0),
-           "simplex candidate above rhs is rejected");
-}
 
 // ============================================================
 //  Dual-gap helper functions
@@ -153,14 +111,36 @@ void test_gap_tolerance() {
 
     EXPECT_NEAR(gpuboscia::gap_absolute(9.0, 10.0), 1.0, 1e-12,
                 "absolute gap matches logger value");
-    EXPECT_NEAR(gpuboscia::gap_relative(9.0, 10.0), 0.1, 1e-12,
-                "relative gap uses max(|bound|, |incumbent|)");
-    EXPECT_NEAR(gpuboscia::gap_relative(0.25, 0.75), 2.0 / 3.0, 1e-12,
+    EXPECT_NEAR(gpuboscia::gap_relative(9.0, 10.0), 1.0 / 9.0, 1e-12,
+                "relative gap uses min(|bound|, |incumbent|)");
+    EXPECT_NEAR(gpuboscia::gap_relative(0.25, 0.75), 2.0, 1e-12,
                 "relative gap does not floor the denominator at one");
-    EXPECT_NEAR(gpuboscia::gap_relative(-10.0, -9.0), 0.1, 1e-12,
+    EXPECT_NEAR(gpuboscia::gap_relative(-10.0, -9.0), 1.0 / 9.0, 1e-12,
                 "relative gap denominator is symmetric in both bounds");
-    EXPECT_NEAR(gpuboscia::gap_relative(0.0, 0.0), 0.0, 1e-12,
-                "zero-over-zero relative gap is zero at a closed gap");
+    EXPECT(std::isinf(gpuboscia::gap_relative(0.0, 0.0)),
+           "both zero bounds have infinite relative gap");
+    EXPECT(std::isinf(gpuboscia::gap_relative(0.0, 1.0)),
+           "zero lower bound has infinite relative gap");
+    EXPECT(std::isinf(gpuboscia::gap_relative(-1.0, 0.0)),
+           "zero incumbent has infinite relative gap");
+    EXPECT(gpuboscia::gap_within_tolerance(0.0, 0.0, 0.0, 0.01),
+           "closed zero gap terminates via absolute tolerance");
+    EXPECT(!gpuboscia::gap_within_tolerance(9.0, 10.0, 0.0, 0.105),
+           "relative stopping uses the smaller magnitude denominator");
+    EXPECT(!gpuboscia::gap_within_tolerance(0.0, 1.0, 0.01, 0.01),
+           "zero lower bound does not terminate an open search");
+    EXPECT(!gpuboscia::gap_within_tolerance(-1.0, 0.0, 0.01, 0.01),
+           "zero incumbent does not terminate an open search");
+    for (double invalid : {std::numeric_limits<double>::infinity(),
+                           -std::numeric_limits<double>::infinity(),
+                           std::numeric_limits<double>::quiet_NaN()}) {
+        EXPECT(std::isinf(gpuboscia::gap_relative(invalid, 1.0))
+                   && std::isinf(gpuboscia::gap_relative(1.0, invalid)),
+               "non-finite bounds have infinite relative gap");
+        EXPECT(!gpuboscia::gap_within_tolerance(invalid, 1.0, 0.01, 0.01)
+                   && !gpuboscia::gap_within_tolerance(1.0, invalid, 0.01, 0.01),
+               "non-finite bounds cannot terminate the search");
+    }
 
     EXPECT(gpuboscia::gap_within_tolerance(9.99, 10.0, 0.02, 1e-12),
            "within absolute tolerance");
@@ -389,44 +369,28 @@ void test_branch_pow2() {
     EXPECT_NEAR(two[1].lb[1], 3.0, 1e-12, "mask=1: lb[1]=ceil(2.5)=3");
 }
 
-// ============================================================
-//  CPU FW initialization through the LMO
-// ============================================================
-void test_cpu_lmo_start_point() {
-    std::cout << "\n[CPU FW LMO start point]\n";
-
-    struct SumOneLMO {
-        void compute_v_cpu(
-            const std::vector<double>& grad,
-            const std::vector<double>&,
-            const std::vector<double>&,
-            std::vector<double>& v) const
-        {
-            v.assign(grad.size(), 0.0);
-            const auto it = std::min_element(grad.begin(), grad.end());
-            v[(size_t)std::distance(grad.begin(), it)] = 1.0;
-        }
-    };
-
-    bool first_gradient_was_feasible = false;
-    Problem prob;
-    prob.n_vars = 2;
-    prob.lb = {0.0, 0.0}; // not feasible for sum(x) == 1
-    prob.ub = {1.0, 1.0};
-    prob.f = [](const std::vector<double>& x) { return x[0] * x[0] + x[1] * x[1]; };
-    prob.grad_f = [&first_gradient_was_feasible](
-        const std::vector<double>& x, std::vector<double>& grad) {
-        first_gradient_was_feasible = std::abs(x[0] + x[1] - 1.0) < 1e-12;
-        grad[0] = 2.0 * x[0];
-        grad[1] = 2.0 * x[1];
-    };
-
-    Node node(0, -1, 0, prob.lb, prob.ub);
-    const RelaxResult result = cpu_frank_wolfe(prob, node, SumOneLMO{}, 1);
-    EXPECT(first_gradient_was_feasible,
-           "first objective gradient is evaluated at an LMO-feasible point");
-    EXPECT_NEAR(result.x[0] + result.x[1], 1.0, 1e-12,
-                "returned iterate remains in the non-box feasible set");
+void test_node_resume_queue() {
+    Node node(7, 3, 2, {0.0, 0.0}, {1.0, 1.0});
+    node.dual_bound = -0.25;
+    node.relaxation_x = {0.2, 0.8};
+    node.relaxation_iterations = 17;
+    ConcurrentQueue queue;
+    queue.push(node);
+    const auto batch = queue.pop_batch(1, 1.0);
+    EXPECT_EQ(batch.size(), size_t(1), "resumed node remains queued");
+    EXPECT_EQ(batch[0].id, 7, "resumption keeps node identity");
+    EXPECT_EQ(batch[0].depth, 2, "resumption keeps node depth");
+    EXPECT_EQ(batch[0].relaxation_x, node.relaxation_x, "queue preserves warm start");
+    EXPECT_EQ(batch[0].relaxation_iterations, 17, "queue preserves iteration schedule");
+    EXPECT_EQ(queue.best_bound(1.0), 1.0, "dispatch removes queued bound");
+    EXPECT_NEAR(batch[0].dual_bound, -0.25, 1e-12, "resumption keeps certificate");
+    queue.push(node);
+    EXPECT_NEAR(queue.best_bound(1.0), -0.25, 1e-12, "queued resume counts in global bound");
+    int next_id = 20;
+    const auto children = branch_pow2(node, next_id, {0.2, 0.8}, {0, 1}, 1);
+    EXPECT(!children.empty() && children[0].relaxation_x.empty()
+               && children[0].relaxation_iterations == 0,
+           "new branch children do not inherit an infeasible warm start");
 }
 
 // ============================================================
@@ -441,7 +405,8 @@ void test_box_lmo_dicg_primitives() {
     const std::vector<double> grad = {-2.0,  4.0, 1.0, -1.0};
     std::vector<double> v(4), a(4);
 
-    box_lmo_cpu(grad, lb, ub, v);
+    for (size_t j = 0; j < grad.size(); ++j)
+        v[j] = grad[j] > 0.0 ? lb[j] : ub[j];
     EXPECT_NEAR(v[0], 4.0, 1e-12, "forward LMO chooses upper bound for negative gradient");
     EXPECT_NEAR(v[1], -2.0, 1e-12, "forward LMO chooses lower bound for positive gradient");
 
@@ -573,18 +538,7 @@ void test_queue_deferred_pruning() {
            "deferred parent pruning removes only its queued children");
 }
 
-void test_raw_oracle_incumbent() {
-    EXPECT(!is_exact_integer_candidate({0.75, 0.75}, {0, 1}),
-           "fractional box oracle vertex cannot become integer incumbent");
-    EXPECT(!is_exact_integer_candidate({1.0 - 1e-8, 1.0}, {0, 1}),
-           "near-integer raw vertex must be rounded before acceptance");
-    EXPECT(is_exact_integer_candidate({1.0, 1.0}, {0, 1}),
-           "integer oracle vertex remains eligible for incumbent");
-    EXPECT(is_exact_integer_candidate({1.0, 0.75}, {0}),
-           "continuous coordinates may remain fractional");
-    EXPECT(!is_exact_integer_candidate({NAN, 1.0}, {0, 1}),
-           "nonfinite oracle vertex cannot become incumbent");
-}
+
 
 static void test_quadratic_exact_step() {
     EXPECT_NEAR(quadratic_exact_step(3, 6, 1), 0.5, 1e-14, "quadratic interior minimum");
@@ -609,9 +563,7 @@ int main() {
 
     test_is_integer_feasible();
     test_queue_deferred_pruning();
-    test_raw_oracle_incumbent();
     test_is_node_feasible();
-    test_rounding_heuristics();
     test_gap_tolerance();
     test_certified_fw_lower_bound();
     test_tree_push_pop();
@@ -622,7 +574,7 @@ int main() {
     test_most_infeasible();
     test_top_k_infeasible();
     test_branch_pow2();
-    test_cpu_lmo_start_point();
+    test_node_resume_queue();
     test_box_lmo_dicg_primitives();
     test_unit_simplex_lmo_dicg_primitives();
     test_equality_simplex_lmo_primitives();

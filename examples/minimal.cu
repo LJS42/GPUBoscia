@@ -12,9 +12,6 @@ struct Quadratic {
     static constexpr int shared_bytes = 0;
     static constexpr bool supports_quadratic_exact = true;
 
-    double f(const std::vector<double>& x) const {
-        return (x[0] - .3) * (x[0] - .3) + (x[1] - .7) * (x[1] - .7);
-    }
     __device__ void prepare_block(int, unsigned char*) const {}
     __device__ void grad(int tid, const double* x, double* g, unsigned char*) const {
         if (tid < 2) g[tid] = 2 * (x[tid] - (tid == 0 ? .3 : .7));
@@ -38,10 +35,6 @@ int main() {
         problem.lb = {0, 0};
         problem.ub = {1, 1};
         problem.int_vars = {0, 1};
-        problem.f = [objective](const auto& x) { return objective.f(x); };
-        problem.grad_f = [](const auto& x, auto& gradient) {
-            gradient = {2 * (x[0] - .3), 2 * (x[1] - .7)};
-        };
         auto settings = gpuboscia::create_default_settings();
         settings.line_search.kind = LineSearchKind::QuadraticExact;
         settings.natural_lower_bound = 0;

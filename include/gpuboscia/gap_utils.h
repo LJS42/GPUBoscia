@@ -34,10 +34,10 @@ inline double gap_relative(double bound, double incumbent) {
     //       gaprel = ----------- .
     //                min(|L|,|U|)
     //
-    // If L == U == 0, the absolute gap is zero and the relative gap is
-    // defined as zero rather than the indeterminate value 0/0.
+    // If either bound is zero, report an infinite relative gap.
+    // A closed zero gap can still satisfy the absolute tolerance.
     const double scale = std::min(std::abs(bound), std::abs(incumbent));
-    if (scale == 0.0) return 0.0;
+    if (scale == 0.0) return kInf;
     return (incumbent - bound) / scale;
 }
 

@@ -32,25 +32,22 @@
 // dicg_maximum_step_local(), and dicg_sum_maximum_step().  BoxLMO and
 // UnitSimplexLMO implement this extended interface.
 //
-// An LMO may also provide one host method used before queue insertion and
-// after branching:
-//
-//   bool check_feasible(const Node& node,
-//                       const std::vector<int>& int_vars) const;
-//
-// If omitted, lmo_check_feasible() falls back to is_node_feasible(), the
-// default box-with-integer-variables feasibility check.  Custom constraint
-// sets should implement check_feasible so empty nodes are not submitted to
-// the relaxation kernel.
+// Node feasibility is checked in the relaxation block before objective work.
+// Every LMO provides a cooperative check returning a block-uniform bool:
+//   __device__ bool check_feasible_device(int tid, int n,
+//       const double* lb, const double* ub, const std::uint8_t* integer_flags,
+//       double* vertex_scratch, double* direction_scratch) const;
+// Common GPU checks validate bounds and integer intervals. The LMO checks
+// its additional constraints; both scratch vectors have n elements.
 //
 // Minimal custom LMO shape:
 //
 //   struct MyLMO {
 //       double param;
 //
-//       bool check_feasible(const Node& node,
-//                           const std::vector<int>& int_vars) const {
-//           return is_node_feasible(node, int_vars);
+//       __device__ bool check_feasible_device(int, int,
+//           const double*, const double*, const std::uint8_t*, double*, double*) const {
+//           return true; // Only for a box; check custom constraints here.
 //       }
 //
 //       __device__ void compute_v(int tid, int n,
@@ -68,6 +65,7 @@
 // ---------------------------------------------------------------
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 #ifdef __CUDACC__
 #include <math_constants.h>
@@ -75,6 +73,37 @@
 #include "bnb.h"
 #include "lmo_dicg.h"
 #include "node.h"
+
+#ifdef __CUDACC__
+// Cooperative sum with a block-uniform result, including partial warps.
+__device__ inline double feasibility_block_sum(double value) {
+    __shared__ double partial[32];
+    __shared__ double total;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const unsigned mask = __activemask();
+    const int lanes = __popc(mask);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        const double other = __shfl_down_sync(mask, value, offset);
+        if (lane + offset < lanes) value += other;
+    }
+    if (lane == 0) partial[tid >> 5] = value;
+    __syncthreads();
+    if (tid < 32) {
+        const int warps = (blockDim.x + 31) >> 5;
+        value = tid < warps ? partial[tid] : 0.0;
+        const unsigned first_mask = __activemask();
+        const int first_lanes = __popc(first_mask);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            const double other = __shfl_down_sync(first_mask, value, offset);
+            if (lane + offset < first_lanes) value += other;
+        }
+        if (tid == 0) total = value;
+    }
+    __syncthreads();
+    return total;
+}
+#endif
 
 struct LmoMinPair {
     double value;
@@ -171,11 +200,9 @@ __device__ inline double lmo_block_sum(double v, int tid)
 struct BoxLMO {
     static constexpr bool supports_dicg = true;
 
-    bool check_feasible(
-        const Node&             node,
-        const std::vector<int>& int_vars) const
-    {
-        return is_node_feasible(node, int_vars);
+    __device__ bool check_feasible_device(int, int, const double*,
+        const double*, const std::uint8_t*, double*, double*) const {
+        return true; // Common GPU bounds/integer-interval check handles boxes.
     }
 
     void compute_v_cpu(
@@ -318,43 +345,30 @@ struct UnitSimplexLMO {
         }
     }
 
-    bool check_feasible(
-        const Node&             node,
-        const std::vector<int>& /*int_vars*/,
-        double                  tol = 1e-9) const
-    {
-        if (node.lb.size() != node.ub.size())
-            return false;
-        if (node.lb.size() > (size_t)MaxN)
-            return false;
-
-        double mandatory = 0.0;
-        double integer_capacity = 0.0;
-        bool has_continuous = false;
-        for (int j = 0; j < (int)node.lb.size(); j++) {
-            if (!is_int[j]) {
-                has_continuous = true;
-                continue;
-            }
-            if (node.lb[j] > node.ub[j] + tol)
-                return false;
-            const double lo = std::ceil(node.lb[j] - tol);
-            const double hi = std::floor(node.ub[j] + tol);
-            if (lo > hi)
-                return false;
-            mandatory += node.lb[j];
-            integer_capacity += node.ub[j];
+    __device__ bool check_feasible_device(int tid, int n, const double* lb,
+        const double* ub, const std::uint8_t* flags, double*, double*) const {
+        if (n > MaxN) return false;
+        bool valid = true, continuous = false;
+        double mandatory = 0.0, capacity = 0.0;
+        for (int j = tid; j < n; j += blockDim.x) {
+            const bool integer = flags ? flags[j] != 0 : is_int[j] != 0;
+            const double lo = integer ? ceil(fmax(0.0, lb[j])) : fmax(0.0, lb[j]);
+            const double hi = integer ? floor(ub[j]) : ub[j];
+            valid &= lo <= hi;
+            mandatory += lo;
+            capacity += hi;
+            continuous |= !integer;
         }
-        if (mandatory > right_side + tol)
-            return false;
+        const bool intervals_valid = __syncthreads_and(valid);
+        const double mandatory_sum = feasibility_block_sum(mandatory);
+        bool feasible = intervals_valid && mandatory_sum <= right_side + 1e-9;
         if constexpr (RequireEquality) {
-            if (!has_continuous && integer_capacity < right_side - tol)
-                return false;
-            if (!has_continuous
-                    && std::abs(right_side - std::round(right_side)) > tol)
-                return false;
+            const double capacity_sum = feasibility_block_sum(capacity);
+            const bool has_continuous = __syncthreads_or(continuous);
+            feasible &= capacity_sum >= right_side - 1e-9
+                && (has_continuous || fabs(right_side - round(right_side)) <= 1e-9);
         }
-        return true;
+        return feasible;
     }
 
     void compute_v_cpu(
@@ -709,16 +723,15 @@ struct BirkhoffLMO {
     }
     static constexpr int reduction_size = next_power_of_two(Order);
 
-    bool check_feasible(
-        const Node& node, const std::vector<int>& /*int_vars*/) const
-    {
-        if ((int)node.lb.size() != variable_count
-                || node.lb.size() != node.ub.size())
-            return false;
-
-        std::vector<double> zero(variable_count, 0.0);
-        std::vector<double> assignment(variable_count, 0.0);
-        return solve_cpu(zero, node.lb, node.ub, assignment, nullptr);
+    __device__ bool check_feasible_device(int tid, int n, const double* lb,
+        const double* ub, const std::uint8_t*, double* vertex, double* direction) const {
+        if (n != variable_count) return false;
+        for (int j = tid; j < n; j += blockDim.x) {
+            direction[j] = 0.0;
+            vertex[j] = 0.0;
+        }
+        __syncthreads();
+        return solve_device(tid, direction, lb, ub, vertex, nullptr);
     }
 
     void compute_v_cpu(
@@ -1081,7 +1094,9 @@ private:
                 for (int pos = tid; pos < reduction_size;
                      pos += blockDim.x) {
                     const int j = pos + 1;
-                    if (j <= k && !used[j]) {
+                    // Unreachable columns have no initialized predecessor.
+                    // The finite sentinel must not become an augmenting edge.
+                    if (j <= k && !used[j] && minv[j] < inf) {
                         reduction_values[pos] = minv[j];
                         reduction_indices[pos] = j;
                     } else {

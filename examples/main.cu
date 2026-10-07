@@ -135,34 +135,14 @@ struct GraphIsoObjective {
     static constexpr int block_threads = Threads;
     static constexpr int shared_bytes = n_vars * (int)sizeof(double) + 16;
     const double* d_A; const double* d_B;
-    const double* h_A; const double* h_B;
 
-    __host__ __device__ double residual_entry(
+    __device__ double residual_entry(
         const double* A, const double* B, const double* x, int r, int c) const {
         double value = 0.0;
         for (int k = 0; k < Order; ++k)
             value += B[r*Order+k] * x[k*Order+c]
                    - x[r*Order+k] * A[k*Order+c];
         return value;
-    }
-    double f(const std::vector<double>& x) const {
-        double value = 0.0;
-        for (int r = 0; r < Order; ++r) for (int c = 0; c < Order; ++c) {
-            const double z = residual_entry(h_A, h_B, x.data(), r, c);
-            value += 0.5 * z * z;
-        }
-        return value;
-    }
-    void gradient_host(const std::vector<double>& x, std::vector<double>& g) const {
-        double residual[n_vars];
-        for (int r=0;r<Order;++r) for(int c=0;c<Order;++c)
-            residual[r*Order+c]=residual_entry(h_A,h_B,x.data(),r,c);
-        for (int p=0;p<Order;++p) for(int q=0;q<Order;++q) {
-            double value=0.0;
-            for(int r=0;r<Order;++r) value += h_B[r*Order+p]*residual[r*Order+q];
-            for(int c=0;c<Order;++c) value -= residual[p*Order+c]*h_A[q*Order+c];
-            g[p*Order+q]=value;
-        }
     }
     __device__ double* residual_buffer(unsigned char* smem) const {
         return reinterpret_cast<double*>((reinterpret_cast<uintptr_t>(smem)+15u)&~uintptr_t(15u));
@@ -233,18 +213,16 @@ int main(int argc, char** argv) {
     MAIN_CUDA_CHECK(cudaMemcpy(d_A,A.data(),A.size()*sizeof(double),cudaMemcpyHostToDevice));
     MAIN_CUDA_CHECK(cudaMemcpy(d_B,B.data(),B.size()*sizeof(double),cudaMemcpyHostToDevice));
     using Objective=GraphIsoObjective<order,threads>;
-    Objective objective{d_A,d_B,A.data(),B.data()};
+    Objective objective{d_A,d_B};
     Problem problem; problem.n_vars=variables;
     problem.lb.assign(variables,0.0); problem.ub.assign(variables,1.0);
     problem.int_vars.resize(variables); std::iota(problem.int_vars.begin(),problem.int_vars.end(),0);
-    problem.f=[objective](const std::vector<double>& x){return objective.f(x);};
-    problem.grad_f=[objective](const std::vector<double>& x,std::vector<double>& g){objective.gradient_host(x,g);};
 
     // A 100x100 instance has 10,000 variables. Keep only a small number of
     // nodes resident so the per-node global workspace does not exhaust VRAM.
     DeviceResidentConfig cfg; cfg.gpu_batch_size=128; cfg.num_streams=2;
     cfg.gpu_max_iters=500; cfg.gpu_eps=opts.gpu_eps; cfg.gpu_eps_decay=opts.gpu_eps_decay;
-    cfg.gpu_eps_min=opts.gpu_eps_min; cfg.serial_iters=1000; cfg.integer_tol=1e-5;
+    cfg.gpu_eps_min=opts.gpu_eps_min; cfg.integer_tol=1e-5;
     cfg.abs_gap_tol=opts.abs_gap_tol; cfg.rel_gap_tol=opts.rel_gap_tol;
     BirkhoffLMO<order> lmo;
     Logger logger(true,opts.log_interval_nodes);

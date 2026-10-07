@@ -116,8 +116,7 @@ int main(int argc, char** argv) {
 
         using Objective =
             GlobalCachedDenseQuadraticObjective<Vertices, Threads>;
-        Objective objective(d_Qt, d_linear, 1.0, 1.0, 0.0,
-                            Q.data(), linear.data());
+        Objective objective(d_Qt, d_linear, 1.0, 1.0, 0.0);
 
         Problem problem;
         problem.n_vars = Vertices;
@@ -125,18 +124,6 @@ int main(int argc, char** argv) {
         problem.ub.assign(Vertices, 1.0);
         problem.int_vars.resize(Vertices);
         std::iota(problem.int_vars.begin(), problem.int_vars.end(), 0);
-        problem.f = [objective](const std::vector<double>& x) {
-            return objective.f(x);
-        };
-        problem.grad_f = [objective](const std::vector<double>& x,
-                                     std::vector<double>& g) {
-            for (int i = 0; i < Vertices; ++i) {
-                double value = objective.h_linear[i];
-                for (int j = 0; j < Vertices; ++j)
-                    value += objective.h_Q[i * Vertices + j] * x[j];
-                g[i] = value;
-            }
-        };
 
         EqualitySimplexLMO<Vertices> lmo(
             static_cast<double>(Cardinality), Vertices, problem.int_vars);
@@ -147,7 +134,6 @@ int main(int argc, char** argv) {
         settings.device.gpu_batch_size = 1024;
         settings.device.num_streams = 2;
         settings.device.gpu_max_iters = 1000;
-        settings.device.serial_iters = 1000;
         settings.device.abs_gap_tol = 1e-7;
         settings.device.rel_gap_tol = 1e-3;
 

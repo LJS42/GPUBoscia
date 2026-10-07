@@ -14,6 +14,10 @@ struct Node {
     std::vector<double> lb;  // lowerbound
     std::vector<double> ub;  // upperbound
 
+    // Only resumed nodes carry an iterate; newly branched nodes start fresh.
+    std::vector<double> relaxation_x;
+    int relaxation_iterations = 0;
+
     double dual_bound;      
     NodeStatus status;
 

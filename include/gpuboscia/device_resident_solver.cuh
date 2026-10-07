@@ -9,7 +9,6 @@
 //   static constexpr int n_vars;
 //   static constexpr int block_threads; // maximum threads per block (warp aligned)
 //   static constexpr int shared_bytes;
-//   double f(const std::vector<double>& x) const;
 //   __device__ double value_local(int tid, const double* x_node,
 //                                 unsigned char* obj_smem) const;
 //   __device__ void prepare_block(int tid, unsigned char* obj_smem) const;
@@ -24,16 +23,15 @@
 //
 // grad() is cooperative over the whole CUDA block and must leave
 // grad_smem[j] = grad f(x_node)[j] for j in [0, n_vars). value_local() is used
-// on the device to keep the best LMO vertex; host f() is still used for the
-// returned relaxation iterate and dual bound. value_local() must return the
+// on the device for iterate values, dual bounds, and the best LMO vertex.
+// Each block also scores feasible integer candidates. value_local() returns the
 // sum of the contributions assigned to the calling thread's block-stride
 // range so it remains correct when n_vars exceeds blockDim.x.
 //
 // LMO requirements:
 //   See lmo.cuh.  The LMO template argument is a public extension point:
-//   users may pass custom CUDA-copyable LMO objects.  If the LMO provides
-//   check_feasible(node, int_vars), the solver uses it before queue insertion
-//   and after branching; otherwise it falls back to box feasibility.
+//   users provide CUDA-copyable LMOs with compute_v() and a cooperative
+//   check_feasible_device(). Nodes and integer candidates are checked on GPU.
 
 #include <cuda_runtime.h>
 #include <cooperative_groups.h>
@@ -61,7 +59,6 @@
 #include "bnb.h"
 #include "branching.h"
 #include "concurrent_queue.h"
-#include "cpu_relax.h"
 #include "gap_utils.h"
 #include "heuristics.h"
 #include "lmo.cuh"
@@ -155,7 +152,149 @@ __device__ inline double drs_block_min(double v, int tid, int nw, double* ws) {
     return r;
 }
 
-template<typename DeviceObjective, typename Algorithm, typename LMO>
+enum DRSNodeState : uint8_t {
+    DRSFractionalUnconverged = 0,
+    DRSFractionalConverged = 1,
+    DRSInfeasible = 2,
+    DRSIntegralUnconverged = 3,
+    DRSIntegralConverged = 4
+};
+
+// Every oracle checks node feasibility cooperatively in the owning block.
+// Return a block-uniform bool; vertex/direction are scratch vectors of size n.
+template<typename LMO>
+__device__ bool drs_node_feasible(const LMO& lmo, int tid, int n,
+    const double* lb, const double* ub, const uint8_t* flags,
+    double* vertex, double* direction) {
+    bool valid = true;
+    for (int j = tid; j < n; j += blockDim.x)
+        if (isnan(lb[j]) || isnan(ub[j]) || lb[j] > ub[j]
+                || (flags && flags[j] && ceil(lb[j]) > floor(ub[j])))
+            valid = false;
+    if (!__syncthreads_and(valid)) return false;
+    return lmo.check_feasible_device(tid, n, lb, ub, flags, vertex, direction);
+}
+
+__device__ inline bool drs_near_integer(int tid, int n, const double* x,
+    const uint8_t* flags, double tol) {
+    bool integral = true;
+    for (int j = tid; j < n; j += blockDim.x)
+        if (!isfinite(x[j]) || (flags && flags[j]
+                && fabs(x[j] - round(x[j])) > tol)) integral = false;
+    return __syncthreads_and(integral);
+
+}
+
+// Custom LMOs may provide a cooperative, block-uniform hook
+// candidate_feasible_device(tid, n, x, lb, ub, tol). The legacy signature
+// without tid is called by thread zero. An optional integer_candidate_device
+// (tid, n, x, lb, ub, integer_flags, candidate). Unknown sets skip rounding.
+template<typename LMO, typename = void>
+struct DRSHasCandidateFeasibility : std::false_type {};
+template<typename LMO>
+struct DRSHasCandidateFeasibility<LMO, std::void_t<decltype(
+    std::declval<const LMO&>().candidate_feasible_device(0,
+        (const double*)nullptr, (const double*)nullptr,
+        (const double*)nullptr, 0.0))>> : std::true_type {};
+
+template<typename LMO, typename = void>
+struct DRSHasCooperativeCandidateFeasibility : std::false_type {};
+template<typename LMO>
+struct DRSHasCooperativeCandidateFeasibility<LMO, std::void_t<decltype(
+    std::declval<const LMO&>().candidate_feasible_device(0, 0,
+        (const double*)nullptr, (const double*)nullptr,
+        (const double*)nullptr, 0.0))>> : std::true_type {};
+
+template<typename LMO>
+__device__ bool drs_rounded_feasible(const LMO& lmo, int tid, int n,
+    const double* x, const double* lb, const double* ub, double tol) {
+    if constexpr (DRSHasCooperativeCandidateFeasibility<LMO>::value) {
+        return lmo.candidate_feasible_device(tid, n, x, lb, ub, tol);
+    } else if constexpr (DRSHasCandidateFeasibility<LMO>::value) {
+        __shared__ bool feasible;
+        if (tid == 0) feasible = lmo.candidate_feasible_device(n, x, lb, ub, tol);
+        __syncthreads();
+        return feasible;
+    }
+    return false;
+}
+__device__ inline bool drs_rounded_feasible(const BoxLMO&, int, int,
+    const double*, const double*, const double*, double) { return true; }
+template<int MaxN, bool Equality>
+__device__ bool drs_rounded_feasible(const UnitSimplexLMO<MaxN, Equality>& lmo,
+    int tid, int n, const double* x, const double*, const double*, double tol) {
+    double sum = 0.0;
+    bool valid = true;
+    for (int j = tid; j < n; j += blockDim.x) {
+        valid &= x[j] >= -tol;
+        sum += x[j];
+    }
+    const bool nonnegative = __syncthreads_and(valid);
+    sum = feasibility_block_sum(sum);
+    return nonnegative && (Equality ? fabs(sum - lmo.right_side) <= tol
+                                   : sum <= lmo.right_side + tol);
+}
+template<int Order>
+__device__ bool drs_rounded_feasible(const BirkhoffLMO<Order>&, int tid, int n,
+    const double* x, const double*, const double*, double tol) {
+    if (n != Order * Order) return false;
+    bool valid = true;
+    for (int i = tid; i < Order; i += blockDim.x) {
+        double row = 0.0, col = 0.0;
+        for (int j = 0; j < Order; ++j) {
+            if (x[i * Order + j] < -tol) valid = false;
+            row += x[i * Order + j];
+            col += x[j * Order + i];
+        }
+        if (fabs(row - 1.0) > tol || fabs(col - 1.0) > tol) valid = false;
+    }
+    return __syncthreads_and(valid);
+}
+
+// LMO vertices already satisfy the oracle's set. Check exact integrality,
+// finite coordinates and branch bounds before retaining their GPU score.
+template<typename Objective>
+__device__ double drs_integer_value(const Objective& obj, int tid, int n,
+    int nw, const double* x, const double* lb, const double* ub,
+    const uint8_t* flags, double tol, double* ws, unsigned char* obj_mem) {
+    __shared__ double score;
+    bool valid = true;
+    for (int j = tid; j < n; j += blockDim.x)
+        if (!isfinite(x[j]) || x[j] < lb[j] - tol || x[j] > ub[j] + tol
+                || (flags && flags[j] && x[j] != round(x[j])))
+            valid = false;
+    if (!__syncthreads_and(valid)) return 1e300;
+    const double value = drs_block_reduce(
+        obj.value_local(tid, x, obj_mem), tid, nw, ws);
+    if (tid == 0) score = isfinite(value) ? value : 1e300;
+    __syncthreads();
+    return score;
+}
+
+template<typename Objective, typename LMO, typename Heuristic>
+__device__ void drs_apply_heuristic_and_score(const Objective& obj, const LMO& lmo,
+    const Heuristic& heuristic, int tid, int n, int nw, const double* x, const double* lb, const double* ub,
+    const uint8_t* flags, double tol, double* candidate, double* best,
+    double* best_value, double* ws, unsigned char* obj_mem) {
+    if (!flags) return;
+    heuristic.generate(lmo, tid, n, x, lb, ub, flags, candidate);
+    __syncthreads();
+    __shared__ bool better;
+    const bool feasible = drs_rounded_feasible(lmo, tid, n, candidate, lb, ub, tol);
+    if (!feasible) return;
+    const double value = drs_integer_value(
+        obj, tid, n, nw, candidate, lb, ub, flags, tol, ws, obj_mem);
+    if (tid == 0) better = value < *best_value;
+    __syncthreads();
+    if (better) {
+        for (int j = tid; j < n; j += blockDim.x) best[j] = candidate[j];
+        if (tid == 0) *best_value = value;
+    }
+    __syncthreads();
+}
+
+template<typename DeviceObjective, typename Algorithm, typename LMO,
+         typename Heuristic = gpuboscia::RoundingHeuristic>
 __global__
 void drs_fw_relax_batch_kernel(
     DeviceObjective obj,
@@ -175,7 +314,9 @@ void drs_fw_relax_batch_kernel(
     size_t          objective_workspace_stride,
     int             N,
     int             max_iters,
-    const double*   eps_by_node)
+    const double*   eps_by_node,
+    const uint8_t* integer_flags = nullptr, double candidate_tol = 1e-9,
+    Heuristic heuristic = {})
 {
     constexpr int n = DeviceObjective::n_vars;
     static_assert(DeviceObjective::block_threads >= 32,
@@ -187,6 +328,7 @@ void drs_fw_relax_batch_kernel(
     const int nw   = blockDim.x >> 5;
     if (node >= N) return;
     const double eps = eps_by_node[node];
+    const int initial_iterations = out_iterations[node];
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     constexpr int work_vectors =
@@ -237,27 +379,38 @@ void drs_fw_relax_batch_kernel(
         done_s = false;
         best_val_s = 1e300;
         best_vertex_val[node] = 1e300;
-        out_iterations[node] = 0;
+        out_iterations[node] = initial_iterations;
     }
     __syncthreads();
+
+    if (!drs_node_feasible(lmo, tid, n, lbn, ubn, integer_flags, v_s, grad)) {
+        if (tid == 0) {
+            converged[node] = DRSInfeasible; // Infeasible, no objective evaluation.
+            out_value[node] = CUDART_INF;
+            out_gap[node] = 0.0;
+        }
+        return;
+    }
 
     obj.prepare_block(tid, obj_smem);
     __syncthreads();
 
-    // Obtain a feasible starting vertex before asking the objective for a
-    // gradient.  The bound vector lbn need not satisfy a custom LMO's set.
-    for (int j = tid; j < n; j += blockDim.x)
-        grad[j] = -1.0 - static_cast<double>(j) / (n + 1.0);
-    __syncthreads();
-    lmo.compute_v(tid, n, grad, lbn, ubn, v_s);
-    __syncthreads();
-    for (int j = tid; j < n; j += blockDim.x)
-        xn[j] = v_s[j];
-    __syncthreads();
+    if (initial_iterations == 0) {
+        // Obtain a feasible starting vertex before asking the objective for a
+        // gradient.  The bound vector lbn need not satisfy a custom LMO's set.
+        for (int j = tid; j < n; j += blockDim.x)
+            grad[j] = -1.0 - static_cast<double>(j) / (n + 1.0);
+        __syncthreads();
+        lmo.compute_v(tid, n, grad, lbn, ubn, v_s);
+        __syncthreads();
+        for (int j = tid; j < n; j += blockDim.x)
+            xn[j] = v_s[j];
+        __syncthreads();
+    }
 
     for (int iter = 0; iter < max_iters; iter++) {
         if (tid == 0)
-            out_iterations[node] = iter + 1;
+            out_iterations[node] = initial_iterations + iter + 1;
         __syncthreads();
         obj.grad(tid, xn, grad, obj_smem);
         __syncthreads();
@@ -265,8 +418,8 @@ void drs_fw_relax_batch_kernel(
         lmo.compute_v(tid, n, grad, lbn, ubn, v_s);
         __syncthreads();
 
-        const double fv = drs_block_reduce(
-            obj.value_local(tid, v_s, obj_smem), tid, nw, ws);
+        const double fv = drs_integer_value(obj, tid, n, nw, v_s, lbn, ubn,
+                integer_flags, candidate_tol, ws, obj_smem);
         if (tid == 0 && fv < best_val_s) {
             best_val_s = fv;
             best_vertex_val[node] = fv;
@@ -274,7 +427,7 @@ void drs_fw_relax_batch_kernel(
         if (tid == 0)
             fv_s = fv;
         __syncthreads();
-        if (fv_s == best_val_s)
+        if (fv_s < 1e299 && fv_s == best_val_s)
             for (int j = tid; j < n; j += blockDim.x)
                 best_vn[j] = v_s[j];
         __syncthreads();
@@ -319,8 +472,8 @@ void drs_fw_relax_batch_kernel(
 
             // The in-face oracle also returns a feasible extreme point, so it
             // is an incumbent candidate just like the forward LMO vertex.
-            const double away_f = drs_block_reduce(
-                obj.value_local(tid, away_s, obj_smem), tid, nw, ws);
+            const double away_f = drs_integer_value(obj, tid, n, nw, away_s, lbn, ubn,
+                integer_flags, candidate_tol, ws, obj_smem);
             if (tid == 0 && away_f < best_val_s) {
                 best_val_s = away_f;
                 best_vertex_val[node] = away_f;
@@ -328,7 +481,7 @@ void drs_fw_relax_batch_kernel(
             if (tid == 0)
                 fv_s = away_f;
             __syncthreads();
-            if (fv_s == best_val_s)
+            if (fv_s < 1e299 && fv_s == best_val_s)
                 for (int j = tid; j < n; j += blockDim.x)
                     best_vn[j] = away_s[j];
             __syncthreads();
@@ -373,7 +526,7 @@ void drs_fw_relax_batch_kernel(
                 if (tid == 0) {
                     const double gamma_max = gamma_s;
                     const double open_loop_step =
-                        alg.step_size(iter, gap_s);
+                        alg.step_size(initial_iterations + iter, gap_s);
                     if constexpr (DRSSafeguardsDICGDropStep<Algorithm>::value) {
                         gamma_s = gamma_max <= open_loop_step
                             ? gamma_max
@@ -390,7 +543,7 @@ void drs_fw_relax_batch_kernel(
                     alg.update(xn, away_s, gamma_s, j);
             }
         } else {
-            const double gamma = alg.step_size(iter, gap_s);
+            const double gamma = alg.step_size(initial_iterations + iter, gap_s);
             for (int j = tid; j < n; j += blockDim.x)
                 alg.update(xn, v_s, gamma, j);
         }
@@ -408,8 +561,8 @@ void drs_fw_relax_batch_kernel(
     lmo.compute_v(tid, n, grad, lbn, ubn, v_s);
     __syncthreads();
 
-    const double final_fv = drs_block_reduce(
-        obj.value_local(tid, v_s, obj_smem), tid, nw, ws);
+    const double final_fv = drs_integer_value(obj, tid, n, nw, v_s, lbn, ubn,
+                integer_flags, candidate_tol, ws, obj_smem);
     if (tid == 0 && final_fv < best_val_s) {
         best_val_s = final_fv;
         best_vertex_val[node] = final_fv;
@@ -417,7 +570,7 @@ void drs_fw_relax_batch_kernel(
     if (tid == 0)
         fv_s = final_fv;
     __syncthreads();
-    if (fv_s == best_val_s)
+    if (fv_s < 1e299 && fv_s == best_val_s)
         for (int j = tid; j < n; j += blockDim.x)
             best_vn[j] = v_s[j];
     __syncthreads();
@@ -434,6 +587,13 @@ void drs_fw_relax_batch_kernel(
         out_gap[node] = final_gap;
         converged[node] = alg.check_converged(final_gap, eps) ? 1 : 0;
     }
+    __syncthreads();
+    drs_apply_heuristic_and_score(obj, lmo, heuristic, tid, n, nw, xn, lbn, ubn,
+        integer_flags, candidate_tol, v_s, best_vn,
+        best_vertex_val + node, ws, obj_smem);
+    if (drs_near_integer(tid, n, xn, integer_flags, candidate_tol) && tid == 0)
+        converged[node] = converged[node]
+            ? DRSIntegralConverged : DRSIntegralUnconverged;
 }
 
 // Low-frontier DICG kernel.  A cooperative grid assigns two complete blocks
@@ -441,14 +601,17 @@ void drs_fw_relax_batch_kernel(
 // state; the odd block computes the in-face oracle at the same time.  Grid
 // barriers are safe here because the launcher admits the kernel only when its
 // complete grid is resident.
-template<typename DeviceObjective, typename Algorithm, typename LMO>
+template<typename DeviceObjective, typename Algorithm, typename LMO,
+         typename Heuristic = gpuboscia::RoundingHeuristic>
 __global__ void drs_dicg_paired_batch_kernel(
     DeviceObjective obj, Algorithm alg, LMO lmo,
     double* x, const double* lb, const double* ub,
     double* out_gap, double* out_value, int* out_iterations, uint8_t* converged,
     double* best_vertex, double* best_vertex_val, double* workspace,
     unsigned char* objective_workspace, size_t objective_workspace_stride,
-    int N, int max_iters, const double* eps_by_node, int* all_done)
+    int N, int max_iters, const double* eps_by_node, int* all_done,
+    const uint8_t* integer_flags = nullptr, double candidate_tol = 1e-9,
+    Heuristic heuristic = {})
 {
     static_assert(DRSUsesDICG<Algorithm>::value,
                   "paired oracle kernel is DICG-only");
@@ -456,6 +619,7 @@ __global__ void drs_dicg_paired_batch_kernel(
     cg::grid_group grid = cg::this_grid();
     const int node = (int)blockIdx.x >> 1;
     const bool forward = ((int)blockIdx.x & 1) == 0;
+    const int initial_iterations = out_iterations[node];
     const int tid = threadIdx.x;
     const int nw = blockDim.x >> 5;
     if (node >= N) return;
@@ -494,23 +658,35 @@ __global__ void drs_dicg_paired_batch_kernel(
     if (forward) {
         if (tid == 0) {
             converged[node] = 0;
-            out_iterations[node] = 0;
+            out_iterations[node] = initial_iterations;
             best_vertex_val[node] = 1e300;
         }
-        obj.prepare_block(tid, obj_mem);
+        const bool feasible = drs_node_feasible(
+            lmo, tid, n, lbn, ubn, integer_flags, v, grad);
+        if (!feasible && tid == 0) {
+            converged[node] = DRSInfeasible;
+            out_value[node] = CUDART_INF;
+            out_gap[node] = 0.0;
+        }
         __syncthreads();
-        for (int j = tid; j < n; j += blockDim.x)
-            grad[j] = -1.0 - static_cast<double>(j) / (n + 1.0);
-        __syncthreads();
-        lmo.compute_v(tid, n, grad, lbn, ubn, v);
-        __syncthreads();
-        for (int j = tid; j < n; j += blockDim.x) xn[j] = v[j];
+        if (feasible) {
+            obj.prepare_block(tid, obj_mem);
+            __syncthreads();
+            if (initial_iterations == 0) {
+                for (int j = tid; j < n; j += blockDim.x)
+                    grad[j] = -1.0 - static_cast<double>(j) / (n + 1.0);
+                __syncthreads();
+                lmo.compute_v(tid, n, grad, lbn, ubn, v);
+                __syncthreads();
+                for (int j = tid; j < n; j += blockDim.x) xn[j] = v[j];
+            }
+        }
     }
     grid.sync();
 
     for (int iter = 0; iter < max_iters; ++iter) {
         if (forward && converged[node] == 0) {
-            if (tid == 0) out_iterations[node] = iter + 1;
+            if (tid == 0) out_iterations[node] = initial_iterations + iter + 1;
             obj.grad(tid, xn, grad, obj_mem);
         }
         grid.sync();
@@ -526,8 +702,8 @@ __global__ void drs_dicg_paired_batch_kernel(
         grid.sync();
 
         if (forward && converged[node] == 0) {
-            const double fv = drs_block_reduce(
-                obj.value_local(tid, v, obj_mem), tid, nw, ws);
+            const double fv = drs_integer_value(obj, tid, n, nw, v, lbn, ubn,
+                integer_flags, candidate_tol, ws, obj_mem);
             if (tid == 0) {
                 candidate_s = fv;
                 candidate_better_s = fv < best_vertex_val[node];
@@ -550,8 +726,8 @@ __global__ void drs_dicg_paired_batch_kernel(
             }
             __syncthreads();
             if (!done_s) {
-                const double af = drs_block_reduce(
-                    obj.value_local(tid, away, obj_mem), tid, nw, ws);
+                const double af = drs_integer_value(obj, tid, n, nw, away, lbn, ubn,
+                integer_flags, candidate_tol, ws, obj_mem);
                 if (tid == 0) {
                     candidate_s = af;
                     candidate_better_s = af < best_vertex_val[node];
@@ -593,7 +769,7 @@ __global__ void drs_dicg_paired_batch_kernel(
                 } else {
                     if (tid == 0) {
                         const double maximum = gamma_s;
-                        const double scheduled = alg.step_size(iter, gap_s);
+                        const double scheduled = alg.step_size(initial_iterations + iter, gap_s);
                         if constexpr (DRSSafeguardsDICGDropStep<Algorithm>::value)
                             gamma_s = maximum <= scheduled
                                 ? maximum : maximum * scheduled;
@@ -619,15 +795,15 @@ __global__ void drs_dicg_paired_batch_kernel(
         if (*all_done) break;
     }
 
-    if (!forward) return;
+    if (!forward || converged[node] == DRSInfeasible) return;
     // Return a certificate coherent with the final iterate, matching the
     // ordinary kernel's post-loop behavior.
     obj.grad(tid, xn, grad, obj_mem);
     __syncthreads();
     lmo.compute_v(tid, n, grad, lbn, ubn, v);
     __syncthreads();
-    const double final_fv = drs_block_reduce(
-        obj.value_local(tid, v, obj_mem), tid, nw, ws);
+    const double final_fv = drs_integer_value(obj, tid, n, nw, v, lbn, ubn,
+                integer_flags, candidate_tol, ws, obj_mem);
     if (tid == 0) {
         candidate_s = final_fv;
         candidate_better_s = final_fv < best_vertex_val[node];
@@ -651,6 +827,13 @@ __global__ void drs_dicg_paired_batch_kernel(
         converged[node] = alg.check_converged(
             final_gap, eps_by_node[node]) ? 1 : 0;
     }
+    __syncthreads();
+    drs_apply_heuristic_and_score(obj, lmo, heuristic, tid, n, nw, xn, lbn, ubn,
+        integer_flags, candidate_tol, v, best,
+        best_vertex_val + node, ws, obj_mem);
+    if (drs_near_integer(tid, n, xn, integer_flags, candidate_tol) && tid == 0)
+        converged[node] = converged[node]
+            ? DRSIntegralConverged : DRSIntegralUnconverged;
 }
 
 struct DeviceResidentConfig {
@@ -664,8 +847,6 @@ struct DeviceResidentConfig {
     double gpu_eps        = 1e-3;
     double gpu_eps_decay  = 0.8;
     double gpu_eps_min    = 1e-6;
-    int    serial_iters   = 10000;
-    double serial_eps     = 1e-5;
     double integer_tol    = 1e-6;
     double abs_gap_tol    = 1e-6;
     double rel_gap_tol    = 1e-2;
@@ -724,6 +905,7 @@ struct DRSStreamSlot {
     double*  h_best_vertex = nullptr;
     double*  h_best_vertex_val = nullptr;
     uint8_t* h_cnv = nullptr;
+    uint8_t* h_integer_flags = nullptr;
 
     double*  d_x   = nullptr;
     double*  d_lb  = nullptr;
@@ -737,6 +919,7 @@ struct DRSStreamSlot {
     double*  d_workspace = nullptr;
     unsigned char* d_objective_workspace = nullptr;
     uint8_t* d_cnv = nullptr;
+    uint8_t* d_integer_flags = nullptr;
     int*     d_all_done = nullptr;
 
     void alloc(int cap, int n, int work_vectors, size_t objective_stride) {
@@ -770,6 +953,8 @@ struct DRSStreamSlot {
         DRS_CUDA_CHECK(cudaMalloc(
             &d_objective_workspace, (size_t)cap * objective_stride));
 
+        DRS_CUDA_CHECK(cudaHostAlloc(&h_integer_flags, n * sizeof(uint8_t), cudaHostAllocDefault));
+        DRS_CUDA_CHECK(cudaMalloc(&d_integer_flags, n * sizeof(uint8_t)));
         DRS_CUDA_CHECK(cudaStreamCreate(&stream));
     }
 
@@ -785,6 +970,7 @@ struct DRSStreamSlot {
         cudaFreeHost(h_best_vertex);
         cudaFreeHost(h_best_vertex_val);
         cudaFreeHost(h_cnv);
+        cudaFreeHost(h_integer_flags);
         cudaFree(d_x);
         cudaFree(d_lb);
         cudaFree(d_ub);
@@ -795,6 +981,7 @@ struct DRSStreamSlot {
         cudaFree(d_best_vertex);
         cudaFree(d_best_vertex_val);
         cudaFree(d_cnv);
+        cudaFree(d_integer_flags);
         cudaFree(d_all_done);
         cudaFree(d_workspace);
         cudaFree(d_objective_workspace);
@@ -816,10 +1003,12 @@ struct DRSCompletedBatch {
     std::vector<double> best_vertex;
     std::vector<double> best_vertex_val;
     std::vector<uint8_t> branched_early;
+    std::vector<uint8_t> node_state;
     std::vector<double> gap, value, lower_bound;
 };
 
-template<typename DeviceObjective, typename Algorithm, typename LMO = BoxLMO>
+template<typename DeviceObjective, typename Algorithm, typename LMO = BoxLMO,
+         typename Heuristic = gpuboscia::RoundingHeuristic>
 class DeviceResidentHybridSolver {
 public:
     DeviceResidentHybridSolver(
@@ -830,11 +1019,18 @@ public:
         DeviceResidentConfig cfg = {},
         LMO                  lmo = {},
         double               time_limit_seconds =
-            std::numeric_limits<double>::infinity())
-        : prob_(prob), obj_(obj), alg_(alg), lmo_(lmo)
+            std::numeric_limits<double>::infinity(),
+        Heuristic heuristic = {})
+        : prob_(prob), obj_(obj), alg_(alg), lmo_(lmo), heuristic_(heuristic)
         , branch_sel_(std::move(branch_sel)), cfg_(cfg)
         , time_limit_seconds_(time_limit_seconds)
     {
+        if (cfg_.gpu_max_iters <= 0 || cfg_.gpu_batch_size <= 0
+                || cfg_.num_streams <= 0)
+            throw std::invalid_argument("GPU iterations, batch size and streams must be positive");
+        for (int j : prob_.int_vars)
+            if (j < 0 || j >= prob_.n_vars)
+                throw std::invalid_argument("integer variable index out of range");
         if (!std::isfinite(cfg_.gpu_eps) || cfg_.gpu_eps <= 0.0
                 || !std::isfinite(cfg_.gpu_eps_min)
                 || cfg_.gpu_eps_min <= 0.0
@@ -857,6 +1053,13 @@ public:
             slots_[i].alloc(
                 cfg_.gpu_batch_size, prob_.n_vars,
                 kernel_work_vectors(), objective_workspace_stride());
+            std::fill(slots_[i].h_integer_flags,
+                      slots_[i].h_integer_flags + prob_.n_vars, uint8_t(0));
+            for (int j : prob_.int_vars) slots_[i].h_integer_flags[j] = 1;
+            DRS_CUDA_CHECK(cudaMemcpyAsync(
+                slots_[i].d_integer_flags, slots_[i].h_integer_flags,
+                prob_.n_vars * sizeof(uint8_t), cudaMemcpyHostToDevice,
+                slots_[i].stream));
             slots_[i].sig = { &completed_mtx_, &completed_cv_, &completed_, i };
             configure_l2_window(slots_[i].stream);
         }
@@ -868,8 +1071,12 @@ public:
     }
 
     void push(const Node& nd) {
-        if (lmo_check_feasible(lmo_, nd, prob_.int_vars))
-            queue_.push(nd);
+        if (nd.lb.size() != (size_t)prob_.n_vars || nd.ub.size() != nd.lb.size()
+                || (!nd.relaxation_x.empty() && nd.relaxation_x.size() != nd.lb.size())
+                || (nd.relaxation_iterations > 0 && nd.relaxation_x.empty())
+                || nd.relaxation_iterations < 0)
+            throw std::invalid_argument("invalid node buffer dimensions or resume state");
+        queue_.push(nd);
     }
 
     void set_progress_callback(
@@ -913,6 +1120,7 @@ private:
     DeviceObjective      obj_;
     Algorithm            alg_;
     LMO                  lmo_;
+    Heuristic      heuristic_;
     BranchStrategy       branch_sel_;
     DeviceResidentConfig cfg_;
 
@@ -965,7 +1173,7 @@ private:
     int kernel_block_threads(int n) const {
         cudaFuncAttributes attrs{};
         DRS_CUDA_CHECK(cudaFuncGetAttributes(
-            &attrs, drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>));
+            &attrs, drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>));
         const int limit = std::min(
             DeviceObjective::block_threads, attrs.maxThreadsPerBlock);
         const int warp_limit = (limit / 32) * 32;
@@ -999,7 +1207,7 @@ private:
             int blocks_per_sm = 0;
             DRS_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
                 &blocks_per_sm,
-                drs_dicg_paired_batch_kernel<DeviceObjective, Algorithm, LMO>,
+                drs_dicg_paired_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>,
                 threads, kernel_dynamic_shared_bytes()));
             const int resident = blocks_per_sm * prop.multiProcessorCount;
             const bool forced = cfg_.dicg_oracle_parallelism ==
@@ -1039,7 +1247,7 @@ private:
             &optin_limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
         DRS_CUDA_CHECK(cudaFuncGetAttributes(
             &attrs,
-            drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>));
+            drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>));
 
         const size_t total_bytes =
             (size_t)attrs.sharedSizeBytes + (size_t)dynamic_bytes;
@@ -1055,7 +1263,7 @@ private:
 
         if (total_bytes > (size_t)default_limit) {
             DRS_CUDA_CHECK(cudaFuncSetAttribute(
-                drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>,
+                drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>,
                 cudaFuncAttributeMaxDynamicSharedMemorySize,
                 dynamic_bytes));
         }
@@ -1064,7 +1272,7 @@ private:
             DRS_CUDA_CHECK(cudaFuncGetAttributes(
                 &paired_attrs,
                 drs_dicg_paired_batch_kernel<
-                    DeviceObjective, Algorithm, LMO>));
+                    DeviceObjective, Algorithm, LMO, Heuristic>));
             const size_t paired_total =
                 (size_t)paired_attrs.sharedSizeBytes + (size_t)dynamic_bytes;
             if (paired_total > (size_t)optin_limit) {
@@ -1072,7 +1280,7 @@ private:
             } else if (paired_total > (size_t)default_limit) {
                 DRS_CUDA_CHECK(cudaFuncSetAttribute(
                     drs_dicg_paired_batch_kernel<
-                        DeviceObjective, Algorithm, LMO>,
+                        DeviceObjective, Algorithm, LMO, Heuristic>,
                     cudaFuncAttributeMaxDynamicSharedMemorySize,
                     dynamic_bytes));
             }
@@ -1152,20 +1360,16 @@ private:
             fill_free_slots();
 
             bool gpu_active = false;
-            bool free_slot = false;
             for (auto& slot : slots_) {
                 if (slot.in_use) {
                     gpu_active = true;
-                } else {
-                    free_slot = true;
                 }
             }
 
             // Never leave the GPU completely idle just because the frontier
             // is smaller than a full batch. This bootstraps the search (and
             // drains its tail) with a partial batch. While another stream is
-            // active, the serial path below keeps expanding nodes in an
-            // attempt to fill the next batch.
+            // active, short batches can use the other free streams.
             if (!gpu_active) {
                 fill_free_slots(true);
                 for (auto& slot : slots_)
@@ -1177,19 +1381,9 @@ private:
                     continue;
             }
 
-            // While a stream is free, use the CPU to expand one queued node
-            // rather than launching a short GPU batch. This can overlap batch
-            // formation with work already running on other streams.
-            auto serial_batch = free_slot
-                ? queue_.pop_batch(1, incumbent_.get())
-                : std::vector<Node>{};
-            if (!serial_batch.empty()) {
-                active_bounds_.insert(serial_batch);
-                active_tasks_.fetch_add(1, std::memory_order_relaxed);
-                run_serial_node(serial_batch[0], serial_batch[0].dual_bound);
-                if (done_.load(std::memory_order_relaxed))
-                    return;
-                fill_free_slots();
+            // Dispatch short batches too: all relaxations run on the GPU.
+            if (has_dispatchable_slot() && !queue_.empty()) {
+                fill_free_slots(true);
             } else if (gpu_active) {
                 std::unique_lock<std::mutex> lk(completed_mtx_);
                 completed_cv_.wait_for(lk, std::chrono::microseconds(200),
@@ -1228,7 +1422,7 @@ private:
         for (auto& slot : slots_) {
             if (slot.in_use) continue;
             // Normally launch only full batches. The caller may allow one
-            // partial batch when every GPU stream would otherwise be idle.
+            // partial batch for a free stream when the frontier is small.
             auto batch = queue_.pop_full_batch(
                 cfg_.gpu_batch_size, incumbent_.get());
             if (batch.empty() && allow_partial)
@@ -1277,51 +1471,21 @@ private:
             std::vector<double> x(begin, begin + prob_.n_vars);
             if (!std::all_of(x.begin(), x.end(),
                     [](double v) { return std::isfinite(v); })
-                    || is_integer_feasible(x, prob_.int_vars, cfg_.integer_tol)) continue;
+                    || batch.node_state[i] >= DRSIntegralUnconverged) continue;
             int nid = next_id_.fetch_add(8, std::memory_order_relaxed);
             auto children = branch_sel_(nd, nid, x, prob_.int_vars);
             batch.branched_early[i] = 1;
-            for (auto& child : children)
-                if (lmo_check_feasible(lmo_, child, prob_.int_vars) && !should_prune(child))
-                    queue_.push(child);
+            for (auto& child : children) {
+                child.relaxation_x.clear();
+                child.relaxation_iterations = 0;
+                if (!should_prune(child)) queue_.push(child);
+            }
             if (queue_.size() >= cfg_.gpu_batch_size) {
                 // This pass submits only one batch, then resumes host work.
                 fill_free_slots(true);
                 return;
             }
         }
-    }
-
-    void run_serial_node(Node nd, double tracked_active_bound) {
-        const double inherited_bound = nd.dual_bound;
-        const double eps = node_tolerance(nd);
-        auto res = cpu_frank_wolfe(prob_, nd, lmo_, cfg_.serial_iters, eps);
-        nd.dual_bound = std::max(inherited_bound, res.dual_bound);
-
-        bool new_incumbent = false;
-        if (res.best_vertex.size() == (size_t)prob_.n_vars
-                && is_exact_integer_candidate(res.best_vertex, prob_.int_vars)
-                && std::isfinite(res.best_vertex_val))
-            new_incumbent = incumbent_.try_update(res.best_vertex_val, res.best_vertex);
-        try_rounded_incumbent(res.x, nd, new_incumbent);
-
-        if (!should_prune(nd)) {
-            if (is_integer_feasible(res.x, prob_.int_vars, cfg_.integer_tol)) {
-                // The rounded heuristic above already tested the strict
-                // integer candidate. Do not store the near-integer raw point.
-            } else {
-                int nid = next_id_.fetch_add(8, std::memory_order_relaxed);
-                for (auto& child : branch_sel_(nd, nid, res.x, prob_.int_vars))
-                    if (lmo_check_feasible(lmo_, child, prob_.int_vars) && !should_prune(child))
-                        queue_.push(child);
-            }
-        }
-
-        const int iter = nodes_done_.fetch_add(1, std::memory_order_relaxed) + 1;
-        active_tasks_.fetch_sub(1, std::memory_order_acq_rel);
-        active_bounds_.erase_one(tracked_active_bound);
-        emit_progress(iter, new_incumbent);
-        finish_if_search_complete();
     }
 
     void submit_slot(DRSStreamSlot& slot, std::vector<Node> batch) {
@@ -1338,13 +1502,14 @@ private:
         for (int i = 0; i < N; i++) {
             const Node& nd = slot.batch_nodes[i];
             for (int j = 0; j < n; j++) {
-                slot.h_x [i*n+j] = nd.lb[j];
+                slot.h_x [i*n+j] = nd.relaxation_x.empty()
+                    ? nd.lb[j] : nd.relaxation_x[j];
                 slot.h_lb[i*n+j] = nd.lb[j];
                 slot.h_ub[i*n+j] = nd.ub[j];
             }
             slot.h_gap[i] = 0.0;
             slot.h_eps[i] = node_tolerance(nd);
-            slot.h_iterations[i] = 0;
+            slot.h_iterations[i] = nd.relaxation_iterations;
             slot.h_best_vertex_val[i] = 1e300;
             slot.h_cnv[i] = 0;
         }
@@ -1389,32 +1554,33 @@ private:
                     &slot.d_best_vertex, &slot.d_best_vertex_val,
                     &slot.d_workspace, &slot.d_objective_workspace,
                     &objective_stride, &launch_N, &max_iters, &slot.d_eps,
-                    &slot.d_all_done
+                    &slot.d_all_done, &slot.d_integer_flags, &cfg_.integer_tol,
+                    &heuristic_
                 };
                 DRS_CUDA_CHECK(cudaLaunchCooperativeKernel(
                     (void*)drs_dicg_paired_batch_kernel<
-                        DeviceObjective, Algorithm, LMO>,
+                        DeviceObjective, Algorithm, LMO, Heuristic>,
                     dim3(2 * N), dim3(block_threads), args, smem,
                     slot.stream));
             } else {
-                drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>
+                drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>
                     <<<N, block_threads, smem, slot.stream>>>(
                         obj_, alg_, lmo_, slot.d_x, slot.d_lb, slot.d_ub,
                         slot.d_gap, slot.d_value, slot.d_iterations, slot.d_cnv,
                         slot.d_best_vertex, slot.d_best_vertex_val,
                         slot.d_workspace, slot.d_objective_workspace,
                         objective_workspace_stride(), N, cfg_.gpu_max_iters,
-                        slot.d_eps);
+                        slot.d_eps, slot.d_integer_flags, cfg_.integer_tol, heuristic_);
             }
         } else {
-            drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO>
+            drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>
                 <<<N, block_threads, smem, slot.stream>>>(
                     obj_, alg_, lmo_, slot.d_x, slot.d_lb, slot.d_ub,
                     slot.d_gap, slot.d_value, slot.d_iterations, slot.d_cnv,
                     slot.d_best_vertex, slot.d_best_vertex_val,
                     slot.d_workspace, slot.d_objective_workspace,
                     objective_workspace_stride(), N, cfg_.gpu_max_iters,
-                    slot.d_eps);
+                    slot.d_eps, slot.d_integer_flags, cfg_.integer_tol, heuristic_);
         }
         DRS_CUDA_CHECK(cudaGetLastError());
 
@@ -1442,12 +1608,16 @@ private:
         DRSCompletedBatch batch;
         batch.n_nodes = N;
         batch.branched_early.assign(N, 0);
+        batch.node_state.assign(slot.h_cnv, slot.h_cnv + N);
         batch.gap.assign(slot.h_gap, slot.h_gap + N);
         batch.value.assign(slot.h_value, slot.h_value + N);
         batch.lower_bound.reserve(N);
         for (int i = 0; i < N; ++i)
             batch.lower_bound.push_back(gpuboscia::certified_fw_lower_bound(
                 slot.batch_nodes[i].dual_bound, batch.value[i], batch.gap[i]));
+        for (int i = 0; i < N; ++i)
+            if (batch.node_state[i] == DRSInfeasible)
+                batch.lower_bound[i] = std::numeric_limits<double>::infinity();
         batch.slot_id = sid;
         batch.generation = slot.generation;
         batch.nodes = std::move(slot.batch_nodes);
@@ -1479,7 +1649,7 @@ private:
                 return;
             Node nd = batch.nodes[i];
             const double active_bound = nd.dual_bound;
-            if (pruned_early_parents_.count(nd.parent_id)) {
+            if (batch.node_state[i] == DRSInfeasible || pruned_early_parents_.count(nd.parent_id)) {
                 const int iter = nodes_done_.fetch_add(1, std::memory_order_relaxed) + 1;
                 active_tasks_.fetch_sub(1, std::memory_order_acq_rel);
                 active_bounds_.erase_one(active_bound);
@@ -1507,12 +1677,10 @@ private:
                 std::vector<double> best_vertex(
                     batch.best_vertex.begin() + (size_t)i*n,
                     batch.best_vertex.begin() + (size_t)(i+1)*n);
-                if (is_exact_integer_candidate(best_vertex, prob_.int_vars)
-                        && std::isfinite(batch.best_vertex_val[i]))
+                if (std::isfinite(batch.best_vertex_val[i]))
                     new_incumbent =
                         incumbent_.try_update(batch.best_vertex_val[i], best_vertex);
             }
-            try_rounded_incumbent(xi, nd, new_incumbent);
 
             const bool certificate_valid =
                 std::isfinite(gap) && gap >= 0.0
@@ -1531,27 +1699,31 @@ private:
                 continue;
             }
 
-            if (is_integer_feasible(xi, prob_.int_vars, cfg_.integer_tol)
+            if (batch.node_state[i] >= DRSIntegralUnconverged
                     && !certificate_valid) {
-                // An integral iterate cannot be branched, but without a
-                // valid FW certificate it also cannot safely close the node.
-                // Use the serial refinement path for this exceptional case;
-                // fractional GPU iterates remain eligible for branching.
-                run_serial_node(nd, active_bound);
+                // Keep this node live, with its certified bound and GPU state.
+                nd.relaxation_x = std::move(xi);
+                nd.relaxation_iterations = batch.iterations[i];
+                queue_.push(nd);
+                active_tasks_.fetch_sub(1, std::memory_order_acq_rel);
+                active_bounds_.erase_one(active_bound);
+                emit_progress(nodes_done_.load(), new_incumbent);
                 continue;
             }
 
             if (done_.load(std::memory_order_relaxed)) {
                 // Stop expanding this completed batch once another path has
                 // proven the search complete.
-            } else if (is_integer_feasible(xi, prob_.int_vars, cfg_.integer_tol)) {
-                // The rounded heuristic above already tested the strict
+            } else if (batch.node_state[i] >= DRSIntegralUnconverged) {
+                // The GPU heuristic already tested the strict
                 // integer candidate. Do not store the near-integer raw point.
             } else if (!batch.branched_early[i]) {
                 int nid = next_id_.fetch_add(8, std::memory_order_relaxed);
-                for (auto& child : branch_sel_(nd, nid, xi, prob_.int_vars))
-                    if (lmo_check_feasible(lmo_, child, prob_.int_vars) && !should_prune(child))
-                        queue_.push(child);
+                for (auto& child : branch_sel_(nd, nid, xi, prob_.int_vars)) {
+                    child.relaxation_x.clear();
+                    child.relaxation_iterations = 0;
+                    if (!should_prune(child)) queue_.push(child);
+                }
             }
 
             const int iter = nodes_done_.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -1633,20 +1805,6 @@ private:
 
     bool should_prune(const Node& nd) const {
         return nd.dual_bound >= incumbent_.get();
-    }
-
-    void try_rounded_incumbent(
-        const std::vector<double>& x,
-        const Node&                nd,
-        bool&                      new_incumbent)
-    {
-        auto candidate = make_integer_candidate(
-            lmo_, x, nd.lb, nd.ub, prob_.int_vars);
-        if (!is_rounded_candidate_feasible(
-                lmo_, candidate, nd.lb, nd.ub, cfg_.integer_tol))
-            return;
-        new_incumbent = incumbent_.try_update(
-            obj_.f(candidate), candidate) || new_incumbent;
     }
 
     void emit_progress(int iter, bool new_incumbent) {

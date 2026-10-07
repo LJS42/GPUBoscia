@@ -187,3 +187,53 @@ The package is now `GPUBoscia`, the C++ namespace and include directory are
 includes, CMake targets, and option names, and configure a fresh build directory.
 The previous names are not compatibility aliases. The local checkout directory
 can keep its existing name.
+
+`Problem` contains variables, bounds, and integer indices. Objectives provide
+CUDA `value_local()` and `grad()` only; no CPU value/gradient callbacks are
+needed. Each node's GPU block rounds its final iterate, validates the candidate,
+and returns the best integer candidate with its GPU score. Box, simplex, and
+Birkhoff sets support parallel rounding checks; custom LMOs may supply the
+`candidate_feasible_device(tid, n, x, lb, ub, tol)` cooperative hook (returning
+a block-uniform boolean) and optionally the cooperative
+`integer_candidate_device(tid, n, x, lb, ub, integer_flags, candidate)` hook.
+The legacy candidate feasibility signature without `tid` remains supported on
+thread zero. Unknown sets skip rounding while retaining integer LMO vertices.
+
+
+Candidate generation can also be replaced independently of the LMO:
+
+```cpp
+struct FloorHeuristic {
+    template<typename LMO>
+    __device__ void generate(const LMO&, int tid, int n,
+        const double* x, const double* lb, const double* ub,
+        const std::uint8_t* integer_flags, double* candidate) const {
+        for (int j = tid; j < n; j += blockDim.x)
+            candidate[j] = integer_flags[j] ? floor(x[j]) : x[j];
+    }
+};
+auto result = gpuboscia::solve(
+    problem, objective, lmo, settings, FloorHeuristic{});
+```
+
+The default `gpuboscia::RoundingHeuristic` rounds integer coordinates and
+preserves continuous coordinates; existing LMO `integer_candidate_device` hooks
+continue to take precedence within that default heuristic. An explicitly supplied
+heuristic replaces candidate generation. All block threads call `generate`; it must
+initialize every candidate coordinate. Heuristics may contain scalars and device
+pointers and are copied into the GPU kernel. The solver synchronizes, checks the
+LMO constraints, bounds and integrality, and scores accepted candidates on GPU.
+Integer LMO vertices are still considered independently. The low-level solver
+accepts the heuristic as its fourth template parameter and final constructor argument.
+
+Near-integer nodes without a convergence certificate return to the queue with
+the same identity, bounds, current iterate, and cumulative iteration count.
+The next GPU batch continues their iteration schedule. `gpu_max_iters` is a
+positive per-dispatch budget; short batches also run on the GPU.
+
+Node feasibility also runs in the owning GPU block. Each LMO supplies
+`check_feasible_device(tid, n, lb, ub, integer_flags, vertex_scratch, direction_scratch)`
+and returns a block-uniform boolean. The solver handles common bound and integer
+interval checks; the hook checks the LMO's additional constraints. An infeasible
+node returns a status in the normal batch result without objective evaluation.
+CPU queue insertion and branching do not call an LMO feasibility callback.
