@@ -109,6 +109,7 @@ the solver does not remove that constraint.
 | Option | Standalone default | Purpose |
 |---|---|---|
 | `GPUBOSCIA_ENABLE_CUDA` | `ON` | Provide the GPU solver target `gpuboscia::gpuboscia` |
+| `GPUBOSCIA_BUILD_BENCHMARKS` | `OFF` | Build the optional CUDA multi-block benchmark |
 | `GPUBOSCIA_BUILD_EXAMPLES` | `ON` when CUDA is enabled | Build standalone examples |
 | `GPUBOSCIA_BUILD_TESTS` | `ON` | Build tests |
 | `GPUBOSCIA_INSTALL` | `ON` | Generate installation and package export rules |
@@ -237,3 +238,13 @@ and returns a block-uniform boolean. The solver handles common bound and integer
 interval checks; the hook checks the LMO's additional constraints. An infeasible
 node returns a status in the normal batch result without objective evaluation.
 CPU queue insertion and branching do not call an LMO feasibility callback.
+
+### Optional persistent multi-block FW
+
+`DeviceResidentConfig::execution_mode = FWExecutionMode::MultiBlock` enables
+cooperative, occupancy-limited groups of `blocks_per_node` blocks per node.
+SingleBlock remains the default. Objectives opt in with `grad_multiblock`;
+existing LMOs execute on the complete leader block. See
+[the multi-block guide](docs/multiblock.md) for the synchronization contract,
+workspace sizing, A40 test/sanitizer commands, and optional benchmark. GPU
+compilation and execution remain to be validated on a CUDA machine.

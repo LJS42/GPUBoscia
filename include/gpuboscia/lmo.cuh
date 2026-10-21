@@ -75,6 +75,12 @@
 #include "node.h"
 
 #ifdef __CUDACC__
+// Same algorithm can use block-local or node-wide scratch and barriers.
+struct LMOBlockContext {
+    int global_tid, total_threads;
+    __device__ LMOBlockContext() : global_tid(threadIdx.x), total_threads(blockDim.x) {}
+    __device__ void node_sync() const { __syncthreads(); }
+};
 // Cooperative sum with a block-uniform result, including partial warps.
 __device__ inline double feasibility_block_sum(double value) {
     __shared__ double partial[32];
@@ -240,6 +246,14 @@ struct BoxLMO {
         const std::vector<double>& ub) const
     {
         return box_dicg_maximum_step_cpu(direction, x, lb, ub);
+    }
+
+    // All K blocks participate; the caller publishes output with a node barrier.
+    template<class Context>
+    __device__ void compute_v_multiblock(Context& ctx, int n,
+        const double* grad, const double* lb, const double* ub, double* v) const {
+        for (int j = ctx.global_tid; j < n; j += ctx.total_threads)
+            v[j] = (grad[j] > 0.0) ? lb[j] : ub[j];
     }
 
     __device__ void compute_v(int tid, int n,
@@ -485,31 +499,38 @@ struct UnitSimplexLMO {
     // when MaxN is not a power of two.  Threads may process multiple network
     // comparators, so sort_size need not be <= blockDim.x.
     __device__ void parallel_greedy_allocate(
-        int tid, int capped_n,
-        const double* grad, const double* ub,
-        double* out, const unsigned char* fixed,
-        double remaining, bool force_full_mass,
-        bool floor_integer_mass) const
-    {
-        __shared__ double sort_keys[sort_size];
-        __shared__ int    sort_indices[sort_size];
-        __shared__ double prefix[sort_size];
+        int, int capped_n, const double* grad, const double* ub,
+        double* out, const unsigned char* fixed, double remaining,
+        bool force_full_mass, bool floor_integer_mass) const {
+        __shared__ double sort_keys[sort_size], prefix[sort_size];
+        __shared__ int sort_indices[sort_size];
+        LMOBlockContext ctx;
+        parallel_greedy_allocate_cooperative(ctx, sort_keys, sort_indices, prefix,
+            capped_n, grad, ub, out, fixed, remaining, force_full_mass, floor_integer_mass);
+    }
 
-        for (int pos = tid; pos < sort_size; pos += blockDim.x) {
+    template<class Context>
+    __device__ void parallel_greedy_allocate_cooperative(Context& ctx,
+        double* sort_keys, int* sort_indices, double* prefix,
+        int capped_n, const double* grad, const double* ub, double* out,
+        const unsigned char* fixed, double remaining,
+        bool force_full_mass, bool floor_integer_mass) const {
+        const int tid = ctx.global_tid;
+        for (int pos = tid; pos < sort_size; pos += ctx.total_threads) {
             const bool eligible = pos < capped_n
                 && (!fixed || !fixed[pos])
                 && (force_full_mass || grad[pos] <= 0.0);
             sort_keys[pos] = eligible ? grad[pos] : CUDART_INF;
             sort_indices[pos] = eligible ? pos : -1;
         }
-        __syncthreads();
+        ctx.node_sync();
 
         // Stable bitonic sort by (gradient, original coordinate).  Padding
         // entries have index -1 and an infinite key, and stay at the end.
         for (int width = 2; width <= sort_size; width <<= 1) {
             for (int stride = width >> 1; stride > 0; stride >>= 1) {
                 for (int left = tid; left < sort_size;
-                     left += blockDim.x) {
+                     left += ctx.total_threads) {
                     const int right = left ^ stride;
                     if (right <= left)
                         continue;
@@ -528,44 +549,44 @@ struct UnitSimplexLMO {
                         sort_indices[right] = li;
                     }
                 }
-                __syncthreads();
+                ctx.node_sync();
             }
         }
 
         // Capacity in sorted order.  A continuous coordinate can consume all
         // remaining mass, while an integer coordinate is bounded by its
         // residual branch interval.
-        for (int pos = tid; pos < sort_size; pos += blockDim.x) {
+        for (int pos = tid; pos < sort_size; pos += ctx.total_threads) {
             const int j = sort_indices[pos];
             prefix[pos] = j < 0 ? 0.0
                 : (is_int[j] ? fmax(ub[j] - out[j], 0.0) : remaining);
         }
-        __syncthreads();
+        ctx.node_sync();
 
         // In-place Blelloch exclusive scan of the capacities.
         for (int offset = 1; offset < sort_size; offset <<= 1) {
             for (int op = tid; op < sort_size / (offset << 1);
-                 op += blockDim.x) {
+                 op += ctx.total_threads) {
                 const int right = (op + 1) * (offset << 1) - 1;
                 prefix[right] += prefix[right - offset];
             }
-            __syncthreads();
+            ctx.node_sync();
         }
         if (tid == 0)
             prefix[sort_size - 1] = 0.0;
-        __syncthreads();
+        ctx.node_sync();
         for (int offset = sort_size >> 1; offset > 0; offset >>= 1) {
             for (int op = tid; op < sort_size / (offset << 1);
-                 op += blockDim.x) {
+                 op += ctx.total_threads) {
                 const int right = (op + 1) * (offset << 1) - 1;
                 const double left_sum = prefix[right - offset];
                 prefix[right - offset] = prefix[right];
                 prefix[right] += left_sum;
             }
-            __syncthreads();
+            ctx.node_sync();
         }
 
-        for (int pos = tid; pos < sort_size; pos += blockDim.x) {
+        for (int pos = tid; pos < sort_size; pos += ctx.total_threads) {
             const int j = sort_indices[pos];
             if (j < 0)
                 continue;
@@ -577,8 +598,175 @@ struct UnitSimplexLMO {
                 add = floor(add + (RequireEquality ? 1e-9 : 0.0));
             out[j] += add;
         }
-        __syncthreads();
+        ctx.node_sync();
     }
+
+    // Tiles remain in shared memory through all local sorting/scan stages.
+    // Only completed sorted runs and tile summaries cross block boundaries.
+    static constexpr int multiblock_tile_size = 128;
+    static constexpr int multiblock_tiles =
+        (sort_size + multiblock_tile_size - 1) / multiblock_tile_size;
+    struct MultiBlockWorkspace {
+        double keys[sort_size], merged_keys[sort_size], prefix[sort_size];
+        int indices[sort_size], merged_indices[sort_size];
+        double mass[multiblock_tiles], tile_sum[multiblock_tiles];
+    };
+    struct TileWorkspace {
+        double keys[multiblock_tile_size], scan[multiblock_tile_size];
+        int indices[multiblock_tile_size];
+    };
+    static constexpr size_t multiblock_workspace_bytes = sizeof(MultiBlockWorkspace);
+    __host__ __device__ static int multiblock_effective_blocks(int blocks, int) {
+        return sort_size <= multiblock_tile_size ? 1
+            : (blocks < multiblock_tiles ? blocks : multiblock_tiles);
+    }
+
+
+    __device__ static bool key_before(double a, int ai, double b, int bi) {
+        return a < b || (a == b && ai >= 0 && (bi < 0 || ai < bi));
+    }
+
+    template<class Context>
+    __device__ void compute_v_multiblock(Context& ctx, int n,
+        const double* grad, const double* lb, const double* ub, double* out) const {
+        if (ctx.block_count == 1 || sort_size <= multiblock_tile_size) {
+            if (ctx.block_rank == 0) compute_v(ctx.thread_rank, n, grad, lb, ub, out);
+            return;
+        }
+        __shared__ TileWorkspace tile;
+        compute_v_hierarchical(ctx, tile, n, grad, lb, ub, out);
+    }
+
+    template<class Context>
+    __device__ void compute_v_hierarchical(Context& ctx, TileWorkspace& tile, int n,
+        const double* grad, const double* lb, const double* ub, double* out) const {
+        auto& ws = *reinterpret_cast<MultiBlockWorkspace*>(ctx.lmo_workspace);
+        const int tid = ctx.thread_rank;
+        const int capped_n = n < MaxN ? n : MaxN;
+        constexpr int tile_size = multiblock_tile_size;
+        for (int j = ctx.global_tid; j < n; j += ctx.total_threads)
+            out[j] = j < capped_n && is_int[j] ? lb[j] : 0.0;
+        for (int t = ctx.block_rank; t < multiblock_tiles; t += ctx.block_count) {
+            for (int j = tid; j < tile_size; j += ctx.threads_per_block) {
+                const int coord = t*tile_size+j;
+                const bool eligible = coord < capped_n && (RequireEquality || grad[coord] <= 0.0);
+                tile.keys[j] = eligible ? grad[coord] : CUDART_INF;
+                tile.indices[j] = eligible ? coord : -1;
+                tile.scan[j] = coord < capped_n && is_int[coord] ? lb[coord] : 0.0;
+            }
+            ctx.block_sync();
+            for (int stride = tile_size/2; stride; stride >>= 1) {
+                for (int j = tid; j < stride; j += ctx.threads_per_block)
+                    tile.scan[j] += tile.scan[j+stride];
+                ctx.block_sync();
+            }
+            if (tid == 0) ws.mass[t] = tile.scan[0];
+            for (int width = 2; width <= tile_size; width <<= 1) {
+                for (int stride = width/2; stride; stride >>= 1) {
+                    for (int left = tid; left < tile_size; left += ctx.threads_per_block) {
+                        const int right = left ^ stride;
+                        if (right <= left) continue;
+                        if (key_before(tile.keys[right], tile.indices[right],
+                                       tile.keys[left], tile.indices[left]) == ((left & width) == 0)) {
+                            const double key = tile.keys[left];
+                            const int index = tile.indices[left];
+                            tile.keys[left] = tile.keys[right]; tile.indices[left] = tile.indices[right];
+                            tile.keys[right] = key; tile.indices[right] = index;
+                        }
+                    }
+                    ctx.block_sync();
+                }
+            }
+            for (int j = tid; j < tile_size; j += ctx.threads_per_block) {
+                ws.keys[t*tile_size+j] = tile.keys[j];
+                ws.indices[t*tile_size+j] = tile.indices[j];
+            }
+            ctx.block_sync(); // The next tile reuses the shared arrays.
+        }
+        ctx.node_sync();
+        double remaining = right_side;
+        for (int t = 0; t < multiblock_tiles; ++t) remaining -= ws.mass[t];
+
+        double* keys = ws.keys;
+        double* merged_keys = ws.merged_keys;
+        int* indices = ws.indices;
+        int* merged_indices = ws.merged_indices;
+        // Each element binary-searches the other sorted run for its destination.
+        // Equal padding keys use original run position to give every writer a
+        // unique destination; real gradient ties use original coordinate index.
+        for (int width = tile_size; width < sort_size; width <<= 1) {
+            for (int pos = ctx.global_tid; pos < sort_size; pos += ctx.total_threads) {
+                const int pair_start = (pos / (2*width)) * (2*width);
+                const bool right_run = pos >= pair_start + width;
+                const int own_start = pair_start + (right_run ? width : 0);
+                const int other_start = pair_start + (right_run ? 0 : width);
+                const double key = keys[pos];
+                const int index = indices[pos];
+                int lo = other_start, hi = other_start + width;
+                while (lo < hi) {
+                    const int mid = (lo+hi)/2;
+                    const bool equal = !key_before(keys[mid], indices[mid], key, index)
+                        && !key_before(key, index, keys[mid], indices[mid]);
+                    if (key_before(keys[mid], indices[mid], key, index) || (equal && right_run)) lo = mid+1;
+                    else hi = mid;
+                }
+                const int dest = pair_start + (pos-own_start) + (lo-other_start);
+                merged_keys[dest] = key;
+                merged_indices[dest] = index;
+            }
+            ctx.node_sync();
+            auto old_keys = keys; keys = merged_keys; merged_keys = old_keys;
+            auto old_indices = indices; indices = merged_indices; merged_indices = old_indices;
+        }
+        for (int t = ctx.block_rank; t < multiblock_tiles; t += ctx.block_count) {
+            for (int j = tid; j < tile_size; j += ctx.threads_per_block) {
+                const int coord = indices[t*tile_size+j];
+                // Read immutable bounds rather than the output buffer.
+                tile.scan[j] = coord < 0 ? 0.0 : (is_int[coord] ? fmax(ub[coord]-lb[coord], 0.0) : remaining);
+            }
+            ctx.block_sync();
+            for (int offset = 1; offset < tile_size; offset <<= 1) {
+                for (int op = tid; op < tile_size/(2*offset); op += ctx.threads_per_block) {
+                    const int right = (op+1)*2*offset-1;
+                    tile.scan[right] += tile.scan[right-offset];
+                }
+                ctx.block_sync();
+            }
+            if (tid == 0) {
+                ws.tile_sum[t] = tile.scan[tile_size-1];
+                tile.scan[tile_size-1] = 0;
+            }
+            ctx.block_sync();
+            for (int offset = tile_size/2; offset; offset >>= 1) {
+                for (int op = tid; op < tile_size/(2*offset); op += ctx.threads_per_block) {
+                    const int right = (op+1)*2*offset-1;
+                    const double left = tile.scan[right-offset];
+                    tile.scan[right-offset] = tile.scan[right];
+                    tile.scan[right] += left;
+                }
+                ctx.block_sync();
+            }
+            for (int j = tid; j < tile_size; j += ctx.threads_per_block)
+                ws.prefix[t*tile_size+j] = tile.scan[j];
+            ctx.block_sync();
+        }
+        ctx.node_sync();
+        // Tile offsets need only the small summary array; no node-wide scan.
+        for (int t = ctx.block_rank; t < multiblock_tiles; t += ctx.block_count) {
+            double before = 0;
+            for (int prev = 0; prev < t; ++prev) before += ws.tile_sum[prev];
+            for (int j = tid; j < tile_size; j += ctx.threads_per_block) {
+                const int pos = t*tile_size+j, coord = indices[pos];
+                if (coord < 0) continue;
+                const double capacity = is_int[coord] ? fmax(ub[coord]-lb[coord], 0.0) : remaining;
+                double add = fmin(fmax(remaining-(before+ws.prefix[pos]), 0.0), capacity);
+                if (RequireEquality && is_int[coord]) add = floor(add+1e-9);
+                out[coord] = (is_int[coord] ? lb[coord] : 0.0) + add;
+            }
+        }
+        // The caller's barrier publishes output and protects scratch reuse.
+    }
+
 
     __device__ void compute_v(int tid, int n,
                                const double* grad,
@@ -716,6 +904,9 @@ struct BirkhoffLMO {
     static_assert(Order > 0, "Birkhoff order must be positive");
     static constexpr bool supports_dicg = true;
     static constexpr int variable_count = Order * Order;
+#ifdef __CUDACC__
+    __host__ __device__
+#endif
     static constexpr int next_power_of_two(int value) {
         int result = 1;
         while (result < value) result <<= 1;
@@ -819,6 +1010,23 @@ struct BirkhoffLMO {
     {
         return 1.0;
     }
+#endif
+
+#ifdef __CUDACC__
+    struct BlockWorkspace {
+        int forced_col[Order], forced_row[Order];
+        int rows[Order], cols[Order];
+        double u[Order + 1], potentials[Order + 1];
+        double minv[Order + 1];
+        int p[Order + 1], way[Order + 1];
+        unsigned char used[Order + 1];
+        double reduction_values[reduction_size];
+        int reduction_indices[reduction_size];
+        int k, current_col, current_row, next_col;
+        double delta;
+        int valid, augment_done;
+    };
+
 #endif
 
 private:
@@ -988,25 +1196,42 @@ private:
         return DeviceMinPair{warp_values[0], warp_indices[0]};
     }
 
-    // Block-parallel shortest-augmenting-path Hungarian algorithm. Each
-    // thread owns a subset of residual columns; the block cooperatively
-    // relaxes them, reduces the next minimum slack, and updates potentials.
-    __device__ static bool solve_device(
-        int tid,
+    // Block-local shortest-augmenting-path Hungarian algorithm.
+    // Threads partition residual columns and cooperatively relax
+    // them, reduce minimum slack, and update potentials.
+    __device__ static bool solve_device(int, const double* cost, const double* lb,
+        const double* ub, double* out, const double* face_point) {
+        __shared__ BlockWorkspace workspace;
+        LMOBlockContext ctx;
+        return solve_cooperative(ctx, workspace, cost, lb, ub, out, face_point);
+    }
+
+    template<class Context>
+    __device__ static bool solve_cooperative(
+        Context& ctx, BlockWorkspace& ws,
         const double* cost, const double* lb,
         const double* ub, double* out, const double* face_point)
     {
-        __shared__ int forced_col[Order], forced_row[Order];
-        __shared__ int rows[Order], cols[Order];
-        __shared__ double u[Order + 1], potentials[Order + 1];
-        __shared__ double minv[Order + 1];
-        __shared__ int p[Order + 1], way[Order + 1];
-        __shared__ unsigned char used[Order + 1];
-        __shared__ double reduction_values[reduction_size];
-        __shared__ int reduction_indices[reduction_size];
-        __shared__ int k, current_col, current_row, next_col;
-        __shared__ double delta;
-        __shared__ int valid, augment_done;
+        const int tid = ctx.global_tid;
+        auto& forced_col = ws.forced_col;
+        auto& forced_row = ws.forced_row;
+        auto& rows = ws.rows;
+        auto& cols = ws.cols;
+        auto& u = ws.u;
+        auto& potentials = ws.potentials;
+        auto& minv = ws.minv;
+        auto& p = ws.p;
+        auto& way = ws.way;
+        auto& used = ws.used;
+        auto& reduction_values = ws.reduction_values;
+        auto& reduction_indices = ws.reduction_indices;
+        auto& k = ws.k;
+        auto& current_col = ws.current_col;
+        auto& current_row = ws.current_row;
+        auto& next_col = ws.next_col;
+        auto& delta = ws.delta;
+        auto& valid = ws.valid;
+        auto& augment_done = ws.augment_done;
         constexpr double inf = 1e300;
 
         if (tid == 0) {
@@ -1044,15 +1269,15 @@ private:
             }
             if (k != kc) valid = 0;
         }
-        __syncthreads();
+        ctx.node_sync();
         if (!valid) return false;
 
-        for (int j = tid; j <= k; j += blockDim.x) {
+        for (int j = tid; j <= k; j += ctx.total_threads) {
             u[j] = 0.0;
             potentials[j] = 0.0;
             p[j] = 0;
         }
-        __syncthreads();
+        ctx.node_sync();
 
         for (int i = 1; i <= k; ++i) {
             if (tid == 0) {
@@ -1060,20 +1285,20 @@ private:
                 current_col = 0;
                 augment_done = 0;
             }
-            for (int j = tid; j <= k; j += blockDim.x) {
+            for (int j = tid; j <= k; j += ctx.total_threads) {
                 minv[j] = inf;
                 used[j] = 0;
             }
-            __syncthreads();
+            ctx.node_sync();
 
             while (!augment_done && valid) {
                 if (tid == 0) {
                     used[current_col] = 1;
                     current_row = p[current_col];
                 }
-                __syncthreads();
+                ctx.node_sync();
 
-                for (int j = tid + 1; j <= k; j += blockDim.x) {
+                for (int j = tid + 1; j <= k; j += ctx.total_threads) {
                     if (used[j]) continue;
                     const int e = rows[current_row - 1] * Order + cols[j - 1];
                     if (ub[e] >= 0.5
@@ -1086,13 +1311,13 @@ private:
                         }
                     }
                 }
-                __syncthreads();
+                ctx.node_sync();
 
                 // Fixed-size shared-memory reduction. Padding entries remain
                 // invalid, so this is deterministic for every block size and
                 // does not rely on shuffle behavior for inactive lanes.
                 for (int pos = tid; pos < reduction_size;
-                     pos += blockDim.x) {
+                     pos += ctx.total_threads) {
                     const int j = pos + 1;
                     // Unreachable columns have no initialized predecessor.
                     // The finite sentinel must not become an augmenting edge.
@@ -1104,11 +1329,11 @@ private:
                         reduction_indices[pos] = -1;
                     }
                 }
-                __syncthreads();
+                ctx.node_sync();
                 for (int stride = reduction_size >> 1; stride > 0;
                      stride >>= 1) {
                     for (int pos = tid; pos < stride;
-                         pos += blockDim.x) {
+                         pos += ctx.total_threads) {
                         const DeviceMinPair left{
                             reduction_values[pos], reduction_indices[pos]};
                         const DeviceMinPair right{
@@ -1118,17 +1343,17 @@ private:
                         reduction_values[pos] = best.value;
                         reduction_indices[pos] = best.index;
                     }
-                    __syncthreads();
+                    ctx.node_sync();
                 }
                 if (tid == 0) {
                     delta = reduction_values[0];
                     next_col = reduction_indices[0];
                     if (next_col < 0 || !isfinite(delta)) valid = 0;
                 }
-                __syncthreads();
+                ctx.node_sync();
                 if (!valid) break;
 
-                for (int j = tid; j <= k; j += blockDim.x) {
+                for (int j = tid; j <= k; j += ctx.total_threads) {
                     if (used[j]) {
                         u[p[j]] += delta;
                         potentials[j] -= delta;
@@ -1136,12 +1361,12 @@ private:
                         minv[j] -= delta;
                     }
                 }
-                __syncthreads();
+                ctx.node_sync();
                 if (tid == 0) {
                     current_col = next_col;
                     augment_done = p[current_col] == 0;
                 }
-                __syncthreads();
+                ctx.node_sync();
             }
             if (!valid) return false;
 
@@ -1152,12 +1377,12 @@ private:
                     current_col = previous_col;
                 } while (current_col != 0);
             }
-            __syncthreads();
+            ctx.node_sync();
         }
 
-        for (int j = tid + 1; j <= k; j += blockDim.x)
+        for (int j = tid + 1; j <= k; j += ctx.total_threads)
             out[rows[p[j] - 1] * Order + cols[j - 1]] = 1.0;
-        __syncthreads();
+        ctx.node_sync();
         return true;
     }
 #endif

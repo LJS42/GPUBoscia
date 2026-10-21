@@ -34,6 +34,7 @@
 //   check_feasible_device(). Nodes and integer candidates are checked on GPU.
 
 #include <cuda_runtime.h>
+#include "multiblock.cuh"
 #include <cooperative_groups.h>
 #include <algorithm>
 #include <atomic>
@@ -134,6 +135,42 @@ __device__ inline double drs_block_reduce(double v, int tid, int nw, double* ws)
     if (tid < 32) r = drs_warp_reduce(r);
     __syncthreads();
     return r;
+}
+
+// Existing single-block reduction order remains unchanged by default.
+template<class Objective>
+__device__ double drs_gap_reduce(const Objective&, double* gradient,
+    const double* x, const double* vertex, int n, int tid, int nw, double* ws) {
+    double local = 0;
+    for (int j = tid; j < n; j += blockDim.x)
+        local += gradient[j] * (x[j] - vertex[j]);
+    return drs_block_reduce(local, tid, nw, ws);
+}
+
+template<class Objective>
+__device__ double drs_gap_reduce(const DRSMultiBlockObjective<Objective>& obj,
+    double* gradient, const double* x, const double* vertex,
+    int n, int tid, int nw, double* ws) {
+    if (tid == 0) {
+        obj.control->gradient = gradient;
+        obj.control->x = x;
+        obj.control->direction = vertex;
+        obj.control->command = DRSNodeCommand::Gap;
+    }
+    obj.ctx.node_sync();
+    double local = 0;
+    for (int j = obj.ctx.global_tid; j < n; j += obj.ctx.total_threads)
+        local += gradient[j] * (x[j] - vertex[j]);
+    const double partial = drs_block_reduce(local, tid, nw, ws);
+    if (tid == 0) obj.control->partials[0] = partial;
+    obj.ctx.node_sync();
+    if (tid == 0) {
+        double gap = 0;
+        for (int b = 0; b < obj.ctx.block_count; ++b) gap += obj.control->partials[b];
+        obj.control->gap_result = gap;
+    }
+    __syncthreads();
+    return obj.control->gap_result;
 }
 
 __device__ inline double drs_warp_min(double v) {
@@ -295,8 +332,8 @@ __device__ void drs_apply_heuristic_and_score(const Objective& obj, const LMO& l
 
 template<typename DeviceObjective, typename Algorithm, typename LMO,
          typename Heuristic = gpuboscia::RoundingHeuristic>
-__global__
-void drs_fw_relax_batch_kernel(
+__device__
+void drs_fw_relax_node(
     DeviceObjective obj,
     Algorithm       alg,
     LMO             lmo,
@@ -315,15 +352,15 @@ void drs_fw_relax_batch_kernel(
     int             N,
     int             max_iters,
     const double*   eps_by_node,
-    const uint8_t* integer_flags = nullptr, double candidate_tol = 1e-9,
-    Heuristic heuristic = {})
+    const uint8_t* integer_flags, double candidate_tol,
+    Heuristic heuristic, int node_index)
 {
     constexpr int n = DeviceObjective::n_vars;
     static_assert(DeviceObjective::block_threads >= 32,
                   "block_threads must allow at least one CUDA warp");
     static_assert(DeviceObjective::block_threads % 32 == 0,
                   "block_threads must be a multiple of the CUDA warp size");
-    const int node = blockIdx.x;
+    const int node = node_index;
     const int tid  = threadIdx.x;
     const int nw   = blockDim.x >> 5;
     if (node >= N) return;
@@ -401,7 +438,7 @@ void drs_fw_relax_batch_kernel(
         for (int j = tid; j < n; j += blockDim.x)
             grad[j] = -1.0 - static_cast<double>(j) / (n + 1.0);
         __syncthreads();
-        lmo.compute_v(tid, n, grad, lbn, ubn, v_s);
+        drs_compute_v(obj, lmo, tid, n, grad, lbn, ubn, v_s);
         __syncthreads();
         for (int j = tid; j < n; j += blockDim.x)
             xn[j] = v_s[j];
@@ -415,7 +452,7 @@ void drs_fw_relax_batch_kernel(
         obj.grad(tid, xn, grad, obj_smem);
         __syncthreads();
 
-        lmo.compute_v(tid, n, grad, lbn, ubn, v_s);
+        drs_compute_v(obj, lmo, tid, n, grad, lbn, ubn, v_s);
         __syncthreads();
 
         const double fv = drs_integer_value(obj, tid, n, nw, v_s, lbn, ubn,
@@ -432,10 +469,7 @@ void drs_fw_relax_batch_kernel(
                 best_vn[j] = v_s[j];
         __syncthreads();
 
-        double local_gap = 0.0;
-        for (int j = tid; j < n; j += blockDim.x)
-            local_gap += grad[j] * (xn[j] - v_s[j]);
-        const double gap = drs_block_reduce(local_gap, tid, nw, ws);
+        const double gap = drs_gap_reduce(obj, grad, xn, v_s, n, tid, nw, ws);
 
         if (tid == 0) {
             gap_s = gap;
@@ -459,8 +493,7 @@ void drs_fw_relax_batch_kernel(
                 &gamma_s, &phi_lo_s, &phi_hi_s, &lo_s, &hi_s,
                 &f_base_s, &best_f_s, &best_gamma_s, &line_done_s);
 
-            for (int j = tid; j < n; j += blockDim.x)
-                xn[j] += gamma * v_s[j];
+            drs_update_partition(obj, alg, n, xn, v_s, gamma, true);
         } else if constexpr (DRSUsesDICG<Algorithm>::value) {
             // The in-face routine minimizes its direction.  Negating the
             // objective gradient therefore returns the away maximizer a.
@@ -520,8 +553,7 @@ void drs_fw_relax_batch_kernel(
                     trial_x, trial_grad, ws, obj_smem,
                     &gamma_s, &phi_lo_s, &phi_hi_s, &lo_s, &hi_s,
                     &f_base_s, &best_f_s, &best_gamma_s, &line_done_s);
-                for (int j = tid; j < n; j += blockDim.x)
-                    xn[j] += gamma * away_s[j];
+                drs_update_partition(obj, alg, n, xn, away_s, gamma, true);
             } else {
                 if (tid == 0) {
                     const double gamma_max = gamma_s;
@@ -539,13 +571,11 @@ void drs_fw_relax_batch_kernel(
                     }
                 }
                 __syncthreads();
-                for (int j = tid; j < n; j += blockDim.x)
-                    alg.update(xn, away_s, gamma_s, j);
+                drs_update_partition(obj, alg, n, xn, away_s, gamma_s, false);
             }
         } else {
             const double gamma = alg.step_size(initial_iterations + iter, gap_s);
-            for (int j = tid; j < n; j += blockDim.x)
-                alg.update(xn, v_s, gamma, j);
+            drs_update_partition(obj, alg, n, xn, v_s, gamma, false);
         }
         __syncthreads();
     }
@@ -558,7 +588,7 @@ void drs_fw_relax_batch_kernel(
     obj.grad(tid, xn, grad, obj_smem);
     __syncthreads();
 
-    lmo.compute_v(tid, n, grad, lbn, ubn, v_s);
+    drs_compute_v(obj, lmo, tid, n, grad, lbn, ubn, v_s);
     __syncthreads();
 
     const double final_fv = drs_integer_value(obj, tid, n, nw, v_s, lbn, ubn,
@@ -575,10 +605,7 @@ void drs_fw_relax_batch_kernel(
             best_vn[j] = v_s[j];
     __syncthreads();
 
-    double final_local_gap = 0.0;
-    for (int j = tid; j < n; j += blockDim.x)
-        final_local_gap += grad[j] * (xn[j] - v_s[j]);
-    const double final_gap = drs_block_reduce(final_local_gap, tid, nw, ws);
+    const double final_gap = drs_gap_reduce(obj, grad, xn, v_s, n, tid, nw, ws);
     __syncthreads();
     const double final_value = drs_block_reduce(
         obj.value_local(tid, xn, obj_smem), tid, nw, ws);
@@ -594,6 +621,117 @@ void drs_fw_relax_batch_kernel(
     if (drs_near_integer(tid, n, xn, integer_flags, candidate_tol) && tid == 0)
         converged[node] = converged[node]
             ? DRSIntegralConverged : DRSIntegralUnconverged;
+}
+
+template<typename DeviceObjective, typename Algorithm, typename LMO,
+         typename Heuristic = gpuboscia::RoundingHeuristic>
+__global__
+void drs_fw_relax_batch_kernel(
+    DeviceObjective obj,
+    Algorithm       alg,
+    LMO             lmo,
+    double*         x,
+    const double*   lb,
+    const double*   ub,
+    double*         out_gap,
+    double*         out_value,
+    int*            out_iterations,
+    uint8_t*        converged,
+    double*         best_vertex,
+    double*         best_vertex_val,
+    double*         workspace,
+    unsigned char*  objective_workspace,
+    size_t          objective_workspace_stride,
+    int             N,
+    int             max_iters,
+    const double*   eps_by_node,
+    const uint8_t* integer_flags = nullptr, double candidate_tol = 1e-9,
+    Heuristic heuristic = {})
+{
+    drs_fw_relax_node(obj, alg, lmo, x, lb, ub, out_gap, out_value,
+        out_iterations, converged, best_vertex, best_vertex_val, workspace,
+        objective_workspace, objective_workspace_stride, N, max_iters,
+        eps_by_node, integer_flags, candidate_tol, heuristic, blockIdx.x);
+}
+
+template<typename DeviceObjective, typename Algorithm, typename LMO,
+         typename Heuristic = gpuboscia::RoundingHeuristic>
+__global__
+void drs_fw_multiblock_kernel(
+    DeviceObjective obj,
+    Algorithm       alg,
+    LMO             lmo,
+    double*         x,
+    const double*   lb,
+    const double*   ub,
+    double*         out_gap,
+    double*         out_value,
+    int*            out_iterations,
+    uint8_t*        converged,
+    double*         best_vertex,
+    double*         best_vertex_val,
+    double*         workspace,
+    unsigned char*  objective_workspace,
+    size_t          objective_workspace_stride,
+    int             N,
+    int             max_iters,
+    const double*   eps_by_node,
+    const uint8_t* integer_flags, double candidate_tol,
+    Heuristic heuristic, int blocks_per_node, DRSNodeControl* controls)
+{
+    if constexpr (DRS_HAS_MULTIBLOCK_ATOMICS && DRSHasMultiBlockGradient<DeviceObjective>::value) {
+        const int node = blockIdx.x / blocks_per_node;
+        auto& control = controls[node];
+        MultiBlockContext ctx(node, blockIdx.x % blocks_per_node,
+                              blocks_per_node, &control.barrier);
+        ctx.lmo_workspace = reinterpret_cast<unsigned char*>(controls)
+            + drs_multiblock_scratch_offset(N, blocks_per_node)
+            + size_t(node) * DRSLMOWorkspace<LMO>::bytes;
+        extern __shared__ __align__(16) unsigned char reduction_smem[];
+        double* reduction_ws = reinterpret_cast<double*>(reduction_smem);
+        DRSMultiBlockObjective<DeviceObjective> collective{obj, ctx, &control};
+        if (ctx.block_rank == 0) {
+            // Packed per-block scratch follows the N control records. No
+            // node vectors are replicated as K grows.
+            if (threadIdx.x == 0)
+                control.partials = reinterpret_cast<double*>(controls + N)
+                    + static_cast<size_t>(node) * blocks_per_node;
+            drs_fw_relax_node(collective, alg, lmo, x, lb, ub, out_gap,
+                out_value, out_iterations, converged, best_vertex,
+                best_vertex_val, workspace, objective_workspace,
+                objective_workspace_stride, N, max_iters, eps_by_node,
+                integer_flags, candidate_tol, heuristic, node);
+            if (threadIdx.x == 0) control.command = DRSNodeCommand::Stop;
+            ctx.node_sync();
+        } else {
+            for (;;) {
+                ctx.node_sync();
+                if (control.command == DRSNodeCommand::Stop) break;
+                if (control.command == DRSNodeCommand::Gradient) {
+                    obj.grad_multiblock(ctx, control.x, control.gradient,
+                                        control.objective_workspace);
+                } else if (control.command == DRSNodeCommand::ForwardLMO) {
+                    if constexpr (DRSHasMultiBlockLMO<LMO>::value)
+                        lmo.compute_v_multiblock(ctx, control.lmo_n, control.x,
+                            control.lmo_lb, control.lmo_ub, control.update_x);
+                } else if (control.command == DRSNodeCommand::Gap) {
+                    double local = 0;
+                    for (int j = ctx.global_tid; j < DeviceObjective::n_vars; j += ctx.total_threads)
+                        local += control.gradient[j] * (control.x[j] - control.direction[j]);
+                    const double partial = drs_block_reduce(local, threadIdx.x, blockDim.x >> 5, reduction_ws);
+                    if (threadIdx.x == 0) control.partials[ctx.block_rank] = partial;
+                } else {
+                    for (int j = ctx.global_tid; j < DeviceObjective::n_vars;
+                         j += ctx.total_threads) {
+                        if (control.command == DRSNodeCommand::AdditiveUpdate)
+                            control.update_x[j] += control.gamma * control.direction[j];
+                        else alg.update(control.update_x, control.direction, control.gamma, j);
+                    }
+                }
+                ctx.node_sync();
+            }
+        }
+    }
 }
 
 // Low-frontier DICG kernel.  A cooperative grid assigns two complete blocks
@@ -836,6 +974,8 @@ __global__ void drs_dicg_paired_batch_kernel(
             ? DRSIntegralConverged : DRSIntegralUnconverged;
 }
 
+enum class FWExecutionMode { SingleBlock, MultiBlock };
+
 struct DeviceResidentConfig {
     enum class DICGOracleParallelism { Auto, Serial, Paired };
     int    gpu_batch_size = 1024;
@@ -854,6 +994,9 @@ struct DeviceResidentConfig {
         DICGOracleParallelism::Auto;
     // Fraction of the cooperative-grid residency limit usable by Auto.
     double dicg_paired_occupancy_fraction = 0.8;
+    // Appended to preserve positional aggregate initialization of older fields.
+    FWExecutionMode execution_mode = FWExecutionMode::SingleBlock;
+    int blocks_per_node = 4;
 };
 
 enum class DRSSchedulingEventType {
@@ -921,6 +1064,7 @@ struct DRSStreamSlot {
     uint8_t* d_cnv = nullptr;
     uint8_t* d_integer_flags = nullptr;
     int*     d_all_done = nullptr;
+    DRSNodeControl* d_node_controls = nullptr;
 
     void alloc(int cap, int n, int work_vectors, size_t objective_stride) {
         capacity = cap;
@@ -983,6 +1127,7 @@ struct DRSStreamSlot {
         cudaFree(d_cnv);
         cudaFree(d_integer_flags);
         cudaFree(d_all_done);
+        cudaFree(d_node_controls);
         cudaFree(d_workspace);
         cudaFree(d_objective_workspace);
         if (stream) cudaStreamDestroy(stream);
@@ -1047,12 +1192,16 @@ public:
         if (prob_.n_vars != DeviceObjective::n_vars)
             throw std::runtime_error("DeviceObjective::n_vars does not match Problem::n_vars");
         configure_kernel_shared_memory();
+        configure_multiblock();
         slots_.resize(cfg_.num_streams);
         for (int i = 0; i < cfg_.num_streams; i++) {
             slots_[i].id = i;
             slots_[i].alloc(
                 cfg_.gpu_batch_size, prob_.n_vars,
                 kernel_work_vectors(), objective_workspace_stride());
+            if (cfg_.execution_mode == FWExecutionMode::MultiBlock)
+                DRS_CUDA_CHECK(cudaMalloc(&slots_[i].d_node_controls,
+                    drs_multiblock_control_bytes(cfg_.gpu_batch_size, cfg_.blocks_per_node, DRSLMOWorkspace<LMO>::bytes)));
             std::fill(slots_[i].h_integer_flags,
                       slots_[i].h_integer_flags + prob_.n_vars, uint8_t(0));
             for (int j : prob_.int_vars) slots_[i].h_integer_flags[j] = 1;
@@ -1111,6 +1260,8 @@ public:
     bool                last_gpu_converged() const { return last_gpu_converged_.load(); }
     bool                reached_tolerance() const { return reached_tolerance_; }
     bool                reached_time_limit() const { return reached_time_limit_; }
+    int                 effective_gpu_batch_size() const { return cfg_.gpu_batch_size; }
+    int                 effective_num_streams() const { return cfg_.num_streams; }
     int                 paired_gpu_batches() const {
         return paired_gpu_batches_.load(std::memory_order_relaxed);
     }
@@ -1147,6 +1298,7 @@ private:
     std::function<void(int, int, double, double, bool)> progress_cb_;
     std::function<void(const DRSSchedulingEvent&)> scheduling_cb_;
     mutable bool paired_kernel_resource_compatible_ = true;
+    int multiblock_device_ = -1;
 
     std::vector<DRSStreamSlot> slots_;
     std::mutex                 completed_mtx_;
@@ -1159,10 +1311,20 @@ private:
               + (Algorithm::uses_secant_line_search ? 2 : 0);
     }
 
-    static constexpr size_t objective_workspace_stride() {
-        constexpr size_t bytes = DeviceObjective::shared_bytes > 0
-            ? (size_t)DeviceObjective::shared_bytes : size_t(16);
-        return (bytes + 15u) & ~size_t(15u);
+    size_t objective_workspace_stride() const {
+        static_assert(DeviceObjective::shared_bytes >= 0, "negative objective workspace");
+        size_t bytes = std::max(size_t(16), size_t(DeviceObjective::shared_bytes));
+        if constexpr (DRSHasMultiBlockWorkspace<DeviceObjective>::value) {
+            if (cfg_.execution_mode == FWExecutionMode::MultiBlock)
+                bytes = std::max(bytes, static_cast<size_t>(obj_.multiblock_workspace_bytes(
+                    cfg_.blocks_per_node, kernel_block_threads(prob_.n_vars))));
+        }
+        if (bytes > std::numeric_limits<size_t>::max() - 15u)
+            throw std::invalid_argument("MultiBlock objective workspace size overflows");
+        const size_t stride = (bytes + 15u) & ~size_t(15u);
+        if (stride > std::numeric_limits<size_t>::max() / size_t(cfg_.gpu_batch_size))
+            throw std::invalid_argument("objective batch workspace size overflows");
+        return stride;
     }
 
     static constexpr int kernel_dynamic_shared_bytes() {
@@ -1172,8 +1334,13 @@ private:
 
     int kernel_block_threads(int n) const {
         cudaFuncAttributes attrs{};
-        DRS_CUDA_CHECK(cudaFuncGetAttributes(
-            &attrs, drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>));
+        if (cfg_.execution_mode == FWExecutionMode::MultiBlock) {
+            DRS_CUDA_CHECK(cudaFuncGetAttributes(
+                &attrs, drs_fw_multiblock_kernel<DeviceObjective, Algorithm, LMO, Heuristic>));
+        } else {
+            DRS_CUDA_CHECK(cudaFuncGetAttributes(
+                &attrs, drs_fw_relax_batch_kernel<DeviceObjective, Algorithm, LMO, Heuristic>));
+        }
         const int limit = std::min(
             DeviceObjective::block_threads, attrs.maxThreadsPerBlock);
         const int warp_limit = (limit / 32) * 32;
@@ -1189,8 +1356,54 @@ private:
                     "gpu_block_threads exceeds the objective/kernel/device limit");
             return cfg_.gpu_block_threads;
         }
-        const int wanted = ((n + 31) / 32) * 32;
-        return std::min(std::max(32, wanted), warp_limit);
+        const long long wanted = ((static_cast<long long>(n) + 31) / 32) * 32;
+        return static_cast<int>(std::min(std::max(32LL, wanted),
+                                         static_cast<long long>(warp_limit)));
+    }
+
+    void configure_multiblock() {
+        if (cfg_.execution_mode != FWExecutionMode::SingleBlock &&
+            cfg_.execution_mode != FWExecutionMode::MultiBlock)
+            throw std::invalid_argument("unknown FW execution mode");
+        if (cfg_.execution_mode != FWExecutionMode::MultiBlock) return;
+        if (cfg_.blocks_per_node < 1)
+            throw std::invalid_argument("MultiBlock blocks_per_node must be positive");
+        if constexpr (!DRS_HAS_MULTIBLOCK_ATOMICS) {
+            throw std::runtime_error("MultiBlock requires CUDA Toolkit 11.6 or newer");
+        } else if constexpr (!DRSHasMultiBlockGradient<DeviceObjective>::value) {
+            throw std::invalid_argument("MultiBlock requires Objective::grad_multiblock");
+        } else {
+            if (cfg_.dicg_oracle_parallelism == DeviceResidentConfig::DICGOracleParallelism::Paired)
+                throw std::invalid_argument("MultiBlock cannot combine with paired DICG");
+            int device, cooperative, sms, active, max_grid_x, default_smem, optin_smem;
+            DRS_CUDA_CHECK(cudaGetDevice(&device));
+            multiblock_device_ = device;
+            DRS_CUDA_CHECK(cudaDeviceGetAttribute(&cooperative, cudaDevAttrCooperativeLaunch, device));
+            if (!cooperative) throw std::runtime_error("MultiBlock requires cooperative launch support");
+            DRS_CUDA_CHECK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device));
+            auto kernel = drs_fw_multiblock_kernel<DeviceObjective, Algorithm, LMO, Heuristic>;
+            cudaFuncAttributes attrs{};
+            DRS_CUDA_CHECK(cudaFuncGetAttributes(&attrs, kernel));
+            DRS_CUDA_CHECK(cudaDeviceGetAttribute(&max_grid_x, cudaDevAttrMaxGridDimX, device));
+            DRS_CUDA_CHECK(cudaDeviceGetAttribute(&default_smem, cudaDevAttrMaxSharedMemoryPerBlock, device));
+            DRS_CUDA_CHECK(cudaDeviceGetAttribute(&optin_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device));
+            const size_t total_smem = attrs.sharedSizeBytes + kernel_dynamic_shared_bytes();
+            if (total_smem > static_cast<size_t>(optin_smem))
+                throw std::invalid_argument("MultiBlock shared memory exceeds device limit");
+            if (total_smem > static_cast<size_t>(default_smem))
+                DRS_CUDA_CHECK(cudaFuncSetAttribute(kernel,
+                    cudaFuncAttributeMaxDynamicSharedMemorySize, kernel_dynamic_shared_bytes()));
+            const int threads = kernel_block_threads(prob_.n_vars);
+            if (threads > attrs.maxThreadsPerBlock)
+                throw std::invalid_argument("MultiBlock block size exceeds kernel limit");
+            DRS_CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active, kernel, threads, kernel_dynamic_shared_bytes()));
+            cfg_.gpu_batch_size = drs_multiblock_batch_limit(cfg_.gpu_batch_size,
+                cfg_.blocks_per_node, cooperative != 0, active, sms, max_grid_x);
+            cfg_.num_streams = 1;
+            // Validate optional Objective scratch before any slot allocations.
+            (void)objective_workspace_stride();
+        }
     }
 
     bool paired_dicg_available(int N, int n) const {
@@ -1220,6 +1433,7 @@ private:
     }
 
     bool choose_paired_dicg(int N, int n) const {
+        if (cfg_.execution_mode == FWExecutionMode::MultiBlock) return false;
         using Mode = DeviceResidentConfig::DICGOracleParallelism;
         if (cfg_.dicg_oracle_parallelism == Mode::Serial) return false;
         bool other_active = false;
@@ -1527,6 +1741,9 @@ private:
     }
 
     void run_slot(DRSStreamSlot& slot, int N, int n) {
+        // CUDA current device is thread-local; occupancy and streams were
+        // configured on the constructing thread's selected device.
+        if (multiblock_device_ >= 0) DRS_CUDA_CHECK(cudaSetDevice(multiblock_device_));
         const size_t xn = (size_t)N * n;
 
         DRS_CUDA_CHECK(cudaMemcpyAsync(slot.d_x,   slot.h_x,   xn * sizeof(double),  cudaMemcpyHostToDevice, slot.stream));
@@ -1541,7 +1758,26 @@ private:
         const int block_threads = kernel_block_threads(n);
         constexpr int smem = kernel_dynamic_shared_bytes();
 
-        if constexpr (DRSUsesDICG<Algorithm>::value) {
+        if (cfg_.execution_mode == FWExecutionMode::MultiBlock) {
+            DRS_CUDA_CHECK(cudaMemsetAsync(slot.d_node_controls, 0,
+                drs_multiblock_control_bytes(N, cfg_.blocks_per_node, DRSLMOWorkspace<LMO>::bytes), slot.stream));
+            size_t objective_stride = objective_workspace_stride();
+            int max_iters = cfg_.gpu_max_iters;
+            int launch_N = N;
+            void* args[] = {
+                &obj_, &alg_, &lmo_, &slot.d_x, &slot.d_lb, &slot.d_ub,
+                &slot.d_gap, &slot.d_value, &slot.d_iterations, &slot.d_cnv,
+                &slot.d_best_vertex, &slot.d_best_vertex_val,
+                &slot.d_workspace, &slot.d_objective_workspace,
+                &objective_stride, &launch_N, &max_iters, &slot.d_eps,
+                &slot.d_integer_flags, &cfg_.integer_tol, &heuristic_,
+                &cfg_.blocks_per_node, &slot.d_node_controls
+            };
+            DRS_CUDA_CHECK(cudaLaunchCooperativeKernel(
+                (void*)drs_fw_multiblock_kernel<DeviceObjective, Algorithm, LMO, Heuristic>,
+                dim3(N * cfg_.blocks_per_node), dim3(block_threads), args,
+                smem, slot.stream));
+        } else if constexpr (DRSUsesDICG<Algorithm>::value) {
             if (slot.paired_dicg) {
                 DRS_CUDA_CHECK(cudaMemsetAsync(
                     slot.d_all_done, 0, sizeof(int), slot.stream));

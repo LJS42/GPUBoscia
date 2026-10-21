@@ -16,6 +16,22 @@ add_library(test_header_includes OBJECT ${_gpuboscia_header_checks})
 target_link_libraries(test_header_includes PRIVATE gpuboscia::core)
 
 if(GPUBOSCIA_ENABLE_CUDA)
+    add_executable(test_multiblock_lmo ../benchmarks/benchmark_lmo.cu)
+    target_link_libraries(test_multiblock_lmo PRIVATE gpuboscia::gpuboscia)
+    set_target_properties(test_multiblock_lmo PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_ARCHITECTURES "${GPUBOSCIA_CUDA_ARCH}"
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+    add_test(NAME multiblock_lmo_tests COMMAND test_multiblock_lmo --test)
+    set_tests_properties(multiblock_lmo_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
+    add_executable(test_multiblock test_multiblock.cu)
+    target_link_libraries(test_multiblock PRIVATE gpuboscia::gpuboscia)
+    set_target_properties(test_multiblock PROPERTIES
+        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_ARCHITECTURES "${GPUBOSCIA_CUDA_ARCH}"
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+    add_test(NAME multiblock_tests COMMAND test_multiblock)
+    set_tests_properties(multiblock_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
     add_executable(test_pipeline test_pipeline.cu)
     target_link_libraries(test_pipeline PRIVATE gpuboscia::gpuboscia)
     set_target_properties(test_pipeline PROPERTIES
