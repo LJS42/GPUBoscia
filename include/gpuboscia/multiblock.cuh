@@ -1,4 +1,5 @@
 #pragma once
+#define GPUBOSCIA_MULTIBLOCK_COLLECTIVES 1
 #include <cuda_runtime.h>
 // cuda::atomic_ref first ships with CUDA 11.6. Older toolkits retain
 // SingleBlock support and reject explicit MultiBlock requests on the host.
@@ -36,6 +37,7 @@ class MultiBlockContext {
     NodeBarrier* barrier_;
 public:
     unsigned char* lmo_workspace = nullptr;
+    double* reduction_partials = nullptr;
     int node_id, block_rank, block_count;
     int thread_rank, threads_per_block, global_tid, total_threads;
     __device__ MultiBlockContext(int node, int rank, int count, NodeBarrier* barrier)
@@ -43,6 +45,29 @@ public:
           thread_rank(threadIdx.x), threads_per_block(blockDim.x),
           global_tid(rank * blockDim.x + threadIdx.x),
           total_threads(count * blockDim.x) {}
+    // All node threads participate; scratch is reusable after the final barrier.
+    __device__ double sum(double value) const {
+        __shared__ double warps[32];
+        __shared__ double block_sum;
+        const int lane = thread_rank & 31;
+        for (int offset = 16; offset; offset /= 2)
+            value += __shfl_down_sync(0xffffffffu,value,offset);
+        if (lane == 0) warps[thread_rank >> 5] = value;
+        __syncthreads();
+        if (thread_rank < 32) {
+            value = thread_rank < (threads_per_block >> 5) ? warps[thread_rank] : 0;
+            for (int offset = 16; offset; offset /= 2)
+                value += __shfl_down_sync(0xffffffffu,value,offset);
+            if (thread_rank == 0) block_sum = value;
+        }
+        __syncthreads();
+        if (thread_rank == 0) reduction_partials[block_rank] = block_sum;
+        node_sync();
+        double total = 0;
+        for (int b = 0; b < block_count; ++b) total += reduction_partials[b];
+        node_sync();
+        return total;
+    }
     __device__ void block_sync() const { __syncthreads(); }
     __device__ void node_sync() const {
         // A single resident block needs no device-wide atomic protocol.
@@ -77,7 +102,7 @@ public:
     }
 };
 
-enum class DRSNodeCommand : int { Stop, Gradient, AdditiveUpdate, PolicyUpdate, Gap, ForwardLMO };
+enum class DRSNodeCommand : int { Stop, Gradient, AdditiveUpdate, PolicyUpdate, Gap, ForwardLMO, Value, FactorValue, Curvature, InFaceLMO, Heuristic };
 
 struct DRSNodeControl {
     NodeBarrier barrier;
@@ -93,6 +118,8 @@ struct DRSNodeControl {
     const double* lmo_lb;
     const double* lmo_ub;
     int lmo_n;
+    const double* face_x;
+    const unsigned char* integer_flags;
 };
 
 // Scratch follows all control records and reduction partials, aligned to 16 bytes.
@@ -154,6 +181,18 @@ struct DRSHasMultiBlockGradient<T, std::void_t<decltype(
         (const double*)nullptr, (double*)nullptr, (unsigned char*)nullptr))>>
     : std::true_type {};
 
+template<class T, class = void> struct DRSHasMultiBlockValue : std::false_type {};
+template<class T> struct DRSHasMultiBlockValue<T, std::void_t<decltype(std::declval<const T&>().value_multiblock(std::declval<MultiBlockContext&>(), (const double*)nullptr, (unsigned char*)nullptr))>> : std::true_type {};
+template<class T, class = void> struct DRSHasMultiBlockFactorValue : std::false_type {};
+template<class T> struct DRSHasMultiBlockFactorValue<T, std::void_t<decltype(std::declval<const T&>().value_from_factor_multiblock(std::declval<MultiBlockContext&>(), (unsigned char*)nullptr))>> : std::true_type {};
+template<class T, class = void> struct DRSHasMultiBlockCurvature : std::false_type {};
+template<class T> struct DRSHasMultiBlockCurvature<T, std::void_t<decltype(std::declval<const T&>().quadratic_curvature_multiblock(std::declval<MultiBlockContext&>(), (const double*)nullptr, (unsigned char*)nullptr))>> : std::true_type {};
+template<class T, class = void> struct DRSHasMultiBlockInFace : std::false_type {};
+template<class T> struct DRSHasMultiBlockInFace<T, std::void_t<decltype(std::declval<const T&>().compute_inface_v_multiblock(std::declval<MultiBlockContext&>(), 0, (const double*)nullptr, (const double*)nullptr, (const double*)nullptr, (const double*)nullptr, (double*)nullptr, 0.0, 0.0))>> : std::true_type {};
+template<class H, class L, class = void> struct DRSHasMultiBlockHeuristic : std::false_type {};
+template<class H, class L> struct DRSHasMultiBlockHeuristic<H,L,std::void_t<decltype(
+    std::declval<const H&>().generate_multiblock(std::declval<MultiBlockContext&>(),std::declval<const L&>(),0,
+        (const double*)nullptr,(const double*)nullptr,(const double*)nullptr,(const unsigned char*)nullptr,(double*)nullptr))>> : std::true_type {};
 // Optional forward oracle collective; legacy LMOs keep their block contract.
 template<class T, class = void>
 struct DRSHasMultiBlockLMO : std::false_type {};
@@ -197,18 +236,50 @@ struct DRSMultiBlockObjective {
         objective.prepare_block(tid, workspace);
     }
     __device__ double value_local(int tid, const double* x, unsigned char* workspace) const {
-        return objective.value_local(tid, x, workspace);
+        if constexpr (DRSHasMultiBlockValue<Objective>::value) {
+            if (threadIdx.x == 0) {
+                control->x = x;
+                control->objective_workspace = workspace;
+                control->command = DRSNodeCommand::Value;
+            }
+            ctx.node_sync();
+            auto context = ctx;
+            const double value = objective.value_multiblock(context,x,workspace);
+            ctx.node_sync();
+            return tid == 0 ? value : 0;
+        } else return objective.value_local(tid,x,workspace);
     }
     template<class T = Objective>
     __device__ auto value_from_factor_local(int tid, unsigned char* workspace) const
         -> decltype(std::declval<const T&>().value_from_factor_local(tid, workspace)) {
-        return objective.value_from_factor_local(tid, workspace);
+        if constexpr (DRSHasMultiBlockFactorValue<Objective>::value) {
+            if (threadIdx.x == 0) {
+                control->objective_workspace = workspace;
+                control->command = DRSNodeCommand::FactorValue;
+            }
+            ctx.node_sync();
+            auto context = ctx;
+            const double value = objective.value_from_factor_multiblock(context,workspace);
+            ctx.node_sync();
+            return tid == 0 ? value : 0;
+        } else return objective.value_from_factor_local(tid,workspace);
     }
     template<class T = Objective>
     __device__ auto quadratic_curvature_local(int tid, const double* direction,
                                              unsigned char* workspace) const
         -> decltype(std::declval<const T&>().quadratic_curvature_local(tid, direction, workspace)) {
-        return objective.quadratic_curvature_local(tid, direction, workspace);
+        if constexpr (DRSHasMultiBlockCurvature<Objective>::value) {
+            if (threadIdx.x == 0) {
+                control->direction = direction;
+                control->objective_workspace = workspace;
+                control->command = DRSNodeCommand::Curvature;
+            }
+            ctx.node_sync();
+            auto context = ctx;
+            const double value = objective.quadratic_curvature_multiblock(context,direction,workspace);
+            ctx.node_sync();
+            return tid == 0 ? value : 0;
+        } else return objective.quadratic_curvature_local(tid,direction,workspace);
     }
     __device__ void grad(int, const double* x, double* gradient,
                          unsigned char* workspace) const {
@@ -263,4 +334,46 @@ __device__ void drs_compute_v(const DRSMultiBlockObjective<Objective>& obj,
     } else {
         lmo.compute_v(tid, n, g, lb, ub, v);
     }
+}
+
+// Dispatch helpers preserve legacy block-only extension points.
+template<class O,class L>
+__device__ void drs_compute_inface(const O&,const L& lmo,int tid,int n,const double* g,
+    const double* x,const double* lb,const double* ub,double* out) {
+    lmo.compute_inface_v(tid,n,g,x,lb,ub,out);
+}
+template<class O,class L>
+__device__ void drs_compute_inface(const DRSMultiBlockObjective<O>& obj,const L& lmo,int tid,int n,
+    const double* g,const double* x,const double* lb,const double* ub,double* out) {
+    if constexpr (DRSHasMultiBlockInFace<L>::value) {
+        if (tid == 0) {
+            obj.control->x=g; obj.control->face_x=x; obj.control->lmo_lb=lb; obj.control->lmo_ub=ub;
+            obj.control->lmo_n=n; obj.control->update_x=out;
+            obj.control->command=DRSNodeCommand::InFaceLMO;
+        }
+        obj.ctx.node_sync();
+        auto ctx=obj.ctx;
+        lmo.compute_inface_v_multiblock(ctx,n,g,x,lb,ub,out);
+        obj.ctx.node_sync();
+    } else lmo.compute_inface_v(tid,n,g,x,lb,ub,out);
+}
+template<class O,class L,class H>
+__device__ void drs_generate_candidate(const O&,const L& lmo,const H& heuristic,int tid,int n,
+    const double* x,const double* lb,const double* ub,const unsigned char* flags,double* out) {
+    heuristic.generate(lmo,tid,n,x,lb,ub,flags,out);
+}
+template<class O,class L,class H>
+__device__ void drs_generate_candidate(const DRSMultiBlockObjective<O>& obj,const L& lmo,const H& heuristic,
+    int tid,int n,const double* x,const double* lb,const double* ub,const unsigned char* flags,double* out) {
+    if constexpr (DRSHasMultiBlockHeuristic<H,L>::value) {
+        if (tid == 0) {
+            obj.control->x=x; obj.control->lmo_lb=lb; obj.control->lmo_ub=ub;
+            obj.control->lmo_n=n; obj.control->integer_flags=flags; obj.control->update_x=out;
+            obj.control->command=DRSNodeCommand::Heuristic;
+        }
+        obj.ctx.node_sync();
+        auto ctx=obj.ctx;
+        heuristic.generate_multiblock(ctx,lmo,n,x,lb,ub,flags,out);
+        obj.ctx.node_sync();
+    } else heuristic.generate(lmo,tid,n,x,lb,ub,flags,out);
 }

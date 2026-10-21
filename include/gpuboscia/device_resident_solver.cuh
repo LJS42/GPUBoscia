@@ -314,7 +314,7 @@ __device__ void drs_apply_heuristic_and_score(const Objective& obj, const LMO& l
     const uint8_t* flags, double tol, double* candidate, double* best,
     double* best_value, double* ws, unsigned char* obj_mem) {
     if (!flags) return;
-    heuristic.generate(lmo, tid, n, x, lb, ub, flags, candidate);
+    drs_generate_candidate(obj,lmo,heuristic,tid,n,x,lb,ub,flags,candidate);
     __syncthreads();
     __shared__ bool better;
     const bool feasible = drs_rounded_feasible(lmo, tid, n, candidate, lb, ub, tol);
@@ -500,7 +500,7 @@ void drs_fw_relax_node(
             for (int j = tid; j < n; j += blockDim.x)
                 grad[j] = -grad[j];
             __syncthreads();
-            lmo.compute_inface_v(tid, n, grad, xn, lbn, ubn, away_s);
+            drs_compute_inface(obj,lmo,tid,n,grad,xn,lbn,ubn,away_s);
             __syncthreads();
 
             // The in-face oracle also returns a feasible extreme point, so it
@@ -687,6 +687,8 @@ void drs_fw_multiblock_kernel(
         ctx.lmo_workspace = reinterpret_cast<unsigned char*>(controls)
             + drs_multiblock_scratch_offset(N, blocks_per_node)
             + size_t(node) * DRSLMOWorkspace<LMO>::bytes;
+        ctx.reduction_partials = reinterpret_cast<double*>(controls+N)
+            + static_cast<size_t>(node)*blocks_per_node;
         extern __shared__ __align__(16) unsigned char reduction_smem[];
         double* reduction_ws = reinterpret_cast<double*>(reduction_smem);
         DRSMultiBlockObjective<DeviceObjective> collective{obj, ctx, &control};
@@ -714,6 +716,21 @@ void drs_fw_multiblock_kernel(
                     if constexpr (DRSHasMultiBlockLMO<LMO>::value)
                         lmo.compute_v_multiblock(ctx, control.lmo_n, control.x,
                             control.lmo_lb, control.lmo_ub, control.update_x);
+                } else if (control.command == DRSNodeCommand::Value) {
+                    if constexpr (DRSHasMultiBlockValue<DeviceObjective>::value)
+                        obj.value_multiblock(ctx,control.x,control.objective_workspace);
+                } else if (control.command == DRSNodeCommand::FactorValue) {
+                    if constexpr (DRSHasMultiBlockFactorValue<DeviceObjective>::value)
+                        obj.value_from_factor_multiblock(ctx,control.objective_workspace);
+                } else if (control.command == DRSNodeCommand::Curvature) {
+                    if constexpr (DRSHasMultiBlockCurvature<DeviceObjective>::value)
+                        obj.quadratic_curvature_multiblock(ctx,control.direction,control.objective_workspace);
+                } else if (control.command == DRSNodeCommand::InFaceLMO) {
+                    if constexpr (DRSHasMultiBlockInFace<LMO>::value)
+                        lmo.compute_inface_v_multiblock(ctx,control.lmo_n,control.x,control.face_x,control.lmo_lb,control.lmo_ub,control.update_x);
+                } else if (control.command == DRSNodeCommand::Heuristic) {
+                    if constexpr (DRSHasMultiBlockHeuristic<Heuristic,LMO>::value)
+                        heuristic.generate_multiblock(ctx,lmo,control.lmo_n,control.x,control.lmo_lb,control.lmo_ub,control.integer_flags,control.update_x);
                 } else if (control.command == DRSNodeCommand::Gap) {
                     double local = 0;
                     for (int j = ctx.global_tid; j < DeviceObjective::n_vars; j += ctx.total_threads)
