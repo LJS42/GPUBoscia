@@ -189,6 +189,10 @@ __device__ inline double drs_block_min(double v, int tid, int nw, double* ws) {
     return r;
 }
 
+// Input-only bit in the existing per-node status buffer. Kernels replace it
+// with their normal output status. It never changes the iteration counter.
+constexpr uint8_t DRSInitialPointSupplied = 0x80;
+
 enum DRSNodeState : uint8_t {
     DRSFractionalUnconverged = 0,
     DRSFractionalConverged = 1,
@@ -366,6 +370,7 @@ void drs_fw_relax_node(
     if (node >= N) return;
     const double eps = eps_by_node[node];
     const int initial_iterations = out_iterations[node];
+    const bool supplied_initial_point = (converged[node] & DRSInitialPointSupplied) != 0;
 
     extern __shared__ __align__(16) unsigned char smem_raw[];
     constexpr int work_vectors =
@@ -432,7 +437,7 @@ void drs_fw_relax_node(
     obj.prepare_block(tid, obj_smem);
     __syncthreads();
 
-    if (initial_iterations == 0) {
+    if (initial_iterations == 0 && !supplied_initial_point) {
         // Obtain a feasible starting vertex before asking the objective for a
         // gradient.  The bound vector lbn need not satisfy a custom LMO's set.
         for (int j = tid; j < n; j += blockDim.x)
@@ -775,6 +780,9 @@ __global__ void drs_dicg_paired_batch_kernel(
     const int node = (int)blockIdx.x >> 1;
     const bool forward = ((int)blockIdx.x & 1) == 0;
     const int initial_iterations = out_iterations[node];
+    const bool supplied_initial_point = (converged[node] & DRSInitialPointSupplied) != 0;
+    // Publish reads before the forward block resets the shared status byte.
+    cg::this_grid().sync();
     const int tid = threadIdx.x;
     const int nw = blockDim.x >> 5;
     if (node >= N) return;
@@ -827,7 +835,7 @@ __global__ void drs_dicg_paired_batch_kernel(
         if (feasible) {
             obj.prepare_block(tid, obj_mem);
             __syncthreads();
-            if (initial_iterations == 0) {
+            if (initial_iterations == 0 && !supplied_initial_point) {
                 for (int j = tid; j < n; j += blockDim.x)
                     grad[j] = -1.0 - static_cast<double>(j) / (n + 1.0);
                 __syncthreads();
@@ -1242,6 +1250,12 @@ public:
                 || (nd.relaxation_iterations > 0 && nd.relaxation_x.empty())
                 || nd.relaxation_iterations < 0)
             throw std::invalid_argument("invalid node buffer dimensions or resume state");
+        if (!nd.relaxation_x.empty())
+            for (size_t j = 0; j < nd.relaxation_x.size(); ++j)
+                if (!std::isfinite(nd.relaxation_x[j])
+                        || nd.relaxation_x[j] < nd.lb[j] - 1e-9
+                        || nd.relaxation_x[j] > nd.ub[j] + 1e-9)
+                    throw std::invalid_argument("initial/resumed node iterate violates finite bounds");
         queue_.push(nd);
     }
 
@@ -1742,7 +1756,8 @@ private:
             slot.h_eps[i] = node_tolerance(nd);
             slot.h_iterations[i] = nd.relaxation_iterations;
             slot.h_best_vertex_val[i] = 1e300;
-            slot.h_cnv[i] = 0;
+            slot.h_cnv[i] = nd.relaxation_x.empty()
+                ? 0 : DRSInitialPointSupplied;
         }
 
         if (slot.slot_thread.joinable())

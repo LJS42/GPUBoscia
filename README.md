@@ -1,5 +1,34 @@
 # GPUBoscia
 
+### Explicit continuous root initialization
+
+`Settings::root_initial_point` optionally supplies the root relaxation iterate:
+
+```cpp
+auto settings = gpuboscia::create_default_settings();
+settings.root_initial_point = {0.25, 0.75}; // size must equal problem.n_vars
+auto result = gpuboscia::solve(problem, objective, BoxLMO{}, settings);
+```
+
+The default empty vector preserves deterministic LMO initialization. A supplied
+point must be finite and feasible in the continuous root set; it need not be
+integral. It is not an incumbent and does not change the iteration counter.
+SingleBlock, MultiBlock and paired DICG all honor it. Newly branched children
+still use LMO initialization; saved continuation iterates remain distinct from
+the user root setting.
+
+The API checks dimensions and bounds, then calls the LMO's optional host method
+`relaxation_feasible_cpu(x, lb, ub, tolerance)` (default tolerance 1e-9).
+Box, bounded simplex and Birkhoff LMOs provide this method. Custom LMOs must
+provide it or set `settings.root_initial_point_feasible`, a host callback with
+the same arguments, to check all additional constraints. A subclass adding
+constraints must override the inherited check. Invalid starts throw
+`std::invalid_argument`; points are not silently clipped or projected.
+
+Low-level callers can set `Node::relaxation_x` with
+`relaxation_iterations == 0` for a fresh explicit start; they must validate
+their custom continuous feasible set before pushing the node.
+
 GPUBoscia is a C++17/CUDA branch-and-bound library that uses Frank–Wolfe or
 Decomposition-Invariant Conditional Gradient (DICG) methods to solve node
 relaxations. Supply an objective, variable bounds, integer variable indices, and

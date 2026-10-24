@@ -27,6 +27,12 @@
 // direction to obtain a feasible initial FW iterate.  Therefore compute_v must
 // return a feasible point for every finite direction, not only for objective
 // gradients encountered during the main FW loop.
+// An optional explicit root iterate bypasses this initialization. To validate
+// custom continuous constraints on the host, provide:
+//   bool relaxation_feasible_cpu(const std::vector<double>& x,
+//       const std::vector<double>& lb, const std::vector<double>& ub,
+//       double tolerance) const;
+// This must check continuous membership, not integrality of an incumbent.
 //
 // A DICG-compatible LMO additionally provides compute_inface_v(),
 // dicg_maximum_step_local(), and dicg_sum_maximum_step().  BoxLMO and
@@ -205,6 +211,11 @@ __device__ inline double lmo_block_sum(double v, int tid)
 
 struct BoxLMO {
     static constexpr bool supports_dicg = true;
+    bool relaxation_feasible_cpu(const std::vector<double>&,
+        const std::vector<double>&, const std::vector<double>&, double) const {
+        return true; // The public API independently validates all box bounds.
+    }
+
 
     __device__ bool check_feasible_device(int, int, const double*,
         const double*, const std::uint8_t*, double*, double*) const {
@@ -468,6 +479,11 @@ struct UnitSimplexLMO {
         return unit_simplex_dicg_maximum_step_cpu(
             right_side, integer_flags, direction, x, lb, ub, tol,
             RequireEquality);
+    }
+
+    bool relaxation_feasible_cpu(const std::vector<double>& x,
+        const std::vector<double>&, const std::vector<double>&, double tol) const {
+        return dicg_linear_feasible_cpu(x, tol);
     }
 
     bool dicg_linear_feasible_cpu(
@@ -904,6 +920,20 @@ struct BirkhoffLMO {
     static_assert(Order > 0, "Birkhoff order must be positive");
     static constexpr bool supports_dicg = true;
     static constexpr int variable_count = Order * Order;
+    bool relaxation_feasible_cpu(const std::vector<double>& x,
+        const std::vector<double>&, const std::vector<double>&, double tol) const {
+        if (x.size() != static_cast<size_t>(variable_count)) return false;
+        for (double value : x) if (value < -tol || value > 1 + tol) return false;
+        for (int i = 0; i < Order; ++i) {
+            double row = 0, column = 0;
+            for (int j = 0; j < Order; ++j) {
+                row += x[i * Order + j]; column += x[j * Order + i];
+            }
+            if (std::abs(row - 1) > tol || std::abs(column - 1) > tol) return false;
+        }
+        return true;
+    }
+
 #ifdef __CUDACC__
     __host__ __device__
 #endif

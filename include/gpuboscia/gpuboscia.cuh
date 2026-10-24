@@ -14,6 +14,7 @@
 #include "line_search_options.h"
 #include "node.h"
 #include "problem.h"
+#include "tree.h"
 
 namespace gpuboscia {
 
@@ -25,6 +26,9 @@ struct Settings {
     std::function<void(int, int, double, double, bool)> progress;
     double time_limit_seconds = std::numeric_limits<double>::infinity();
     double natural_lower_bound = -std::numeric_limits<double>::infinity();
+    // Continuous root iterate, not an integer incumbent. Empty selects LMO initialization.
+    std::vector<double> root_initial_point;
+    RootInitialPointValidator root_initial_point_feasible;
 };
 
 struct Result {
@@ -59,6 +63,8 @@ Result solve_with_algorithm(
     Algorithm algorithm,
     Heuristic heuristic = {})
 {
+    validate_root_initial_point(problem, lmo, settings.root_initial_point,
+                                settings.root_initial_point_feasible);
     BranchStrategy branch = settings.branch;
     if (!branch) {
         const double integer_tol = settings.device.integer_tol;
@@ -83,6 +89,7 @@ Result solve_with_algorithm(
         throw std::invalid_argument(
             "natural lower bound must be finite or negative infinity");
     root.dual_bound = settings.natural_lower_bound;
+    root.relaxation_x = settings.root_initial_point;
     solver.push(root);
 
     const auto started = std::chrono::steady_clock::now();

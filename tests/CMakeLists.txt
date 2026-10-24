@@ -3,6 +3,10 @@ target_link_libraries(test_cpu PRIVATE gpuboscia::core)
 set_target_properties(test_cpu PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 add_test(NAME cpu_tests COMMAND test_cpu)
 
+add_executable(test_root_initial_point_cpu test_root_initial_point.cpp)
+target_link_libraries(test_root_initial_point_cpu PRIVATE gpuboscia::core)
+add_test(NAME root_initial_point_cpu COMMAND test_root_initial_point_cpu)
+
 # Each CPU header must compile without incidental includes from another header.
 file(GLOB _gpuboscia_cpu_headers "${PROJECT_SOURCE_DIR}/include/gpuboscia/*.h")
 set(_gpuboscia_header_checks)
@@ -16,6 +20,14 @@ add_library(test_header_includes OBJECT ${_gpuboscia_header_checks})
 target_link_libraries(test_header_includes PRIVATE gpuboscia::core)
 
 if(GPUBOSCIA_ENABLE_CUDA)
+    add_executable(test_root_initial_point test_root_initial_point.cu)
+    target_link_libraries(test_root_initial_point PRIVATE gpuboscia::gpuboscia)
+    set_target_properties(test_root_initial_point PROPERTIES
+        CUDA_ARCHITECTURES "${GPUBOSCIA_CUDA_ARCH}"
+        CUDA_SEPARABLE_COMPILATION ON
+        RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+    add_test(NAME root_initial_point_cuda COMMAND test_root_initial_point)
+    set_tests_properties(root_initial_point_cuda PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 90)
     add_executable(test_multiblock_lmo ../benchmarks/benchmark_lmo.cu)
     target_link_libraries(test_multiblock_lmo PRIVATE gpuboscia::gpuboscia)
     set_target_properties(test_multiblock_lmo PROPERTIES

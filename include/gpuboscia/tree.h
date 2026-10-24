@@ -4,6 +4,12 @@
 #include <limits>
 #include <algorithm>
 #include <numeric>
+#include <cmath>
+#include <functional>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include "problem.h"
 #include "node.h"
 #include "node_select.h"
 #include "branching.h"
@@ -90,3 +96,53 @@ private:
     // push/pop/update_incumbent so global_lower_bound() is an O(1) read.
     std::multiset<double> lb_set_;
 };
+
+// Root relaxation initialization shared by CPU and GPU entry points.
+namespace gpuboscia {
+using RootInitialPointValidator = std::function<bool(
+    const std::vector<double>&, const std::vector<double>&,
+    const std::vector<double>&, double)>;
+
+template<class LMO, class = void>
+struct HasRelaxationPointCheck : std::false_type {};
+template<class LMO>
+struct HasRelaxationPointCheck<LMO, std::void_t<decltype(
+    std::declval<const LMO&>().relaxation_feasible_cpu(
+        std::declval<const std::vector<double>&>(),
+        std::declval<const std::vector<double>&>(),
+        std::declval<const std::vector<double>&>(), 0.0))>> : std::true_type {};
+
+inline void validate_initial_point_bounds(
+    const Problem& problem, const std::vector<double>& x, double tolerance) {
+    if (!std::isfinite(tolerance) || tolerance < 0
+            || problem.n_vars <= 0 || x.size() != static_cast<size_t>(problem.n_vars)
+            || problem.lb.size() != x.size() || problem.ub.size() != x.size())
+        throw std::invalid_argument("invalid root initial point dimensions or tolerance");
+    for (size_t j = 0; j < x.size(); ++j)
+        if (!std::isfinite(x[j]) || std::isnan(problem.lb[j])
+                || std::isnan(problem.ub[j]) || problem.lb[j] > problem.ub[j]
+                || x[j] < problem.lb[j] - tolerance
+                || x[j] > problem.ub[j] + tolerance)
+            throw std::invalid_argument("root initial point is nonfinite or violates bounds");
+}
+
+template<class LMO>
+void validate_root_initial_point(
+    const Problem& problem, const LMO& lmo, const std::vector<double>& x,
+    const RootInitialPointValidator& validator = {}, double tolerance = 1e-9) {
+    // An empty vector means the existing deterministic LMO initialization.
+    if (x.empty()) return;
+    validate_initial_point_bounds(problem, x, tolerance);
+    bool feasible = false;
+    if (validator)
+        feasible = validator(x, problem.lb, problem.ub, tolerance);
+    else if constexpr (HasRelaxationPointCheck<LMO>::value)
+        feasible = lmo.relaxation_feasible_cpu(x, problem.lb, problem.ub, tolerance);
+    else
+        throw std::invalid_argument(
+            "root initial point requires LMO::relaxation_feasible_cpu or "
+            "Settings::root_initial_point_feasible for custom constraints");
+    if (!feasible)
+        throw std::invalid_argument("root initial point violates the LMO's continuous feasible set");
+}
+} // namespace gpuboscia

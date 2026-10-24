@@ -14,7 +14,9 @@ struct Node {
     std::vector<double> lb;  // lowerbound
     std::vector<double> ub;  // upperbound
 
-    // Only resumed nodes carry an iterate; newly branched nodes start fresh.
+    // Explicit initial points and resumed nodes carry an iterate.
+    // A nonempty iterate with zero iterations is a fresh user-supplied start.
+    // Newly branched nodes start fresh through their LMO.
     std::vector<double> relaxation_x;
     int relaxation_iterations = 0;
 
